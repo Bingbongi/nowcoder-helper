@@ -1,0 +1,251 @@
+{
+  "name": "nowcoder-helper",
+  "displayName": "Nowcoder Helper",
+  "description": "牛客竞赛 VSCode 助手：登录、公开比赛、报名、创建比赛目录、一键提交、我的比赛提交记录和排行榜。",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.92.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:nowcoder.app",
+    "onView:nowcoderRight.app"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "nowcoder",
+          "title": "牛客",
+          "icon": "resources/nowcoder.svg"
+        }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "nowcoderRight",
+          "title": "牛客",
+          "icon": "resources/nowcoder.svg"
+        }
+      ]
+    },
+    "views": {
+      "nowcoder": [
+        {
+          "id": "nowcoder.app",
+          "name": "主页",
+          "type": "webview",
+          "when": "config.nowcoder.interfacePosition != 'right'"
+        }
+      ],
+      "nowcoderRight": [
+        {
+          "id": "nowcoderRight.app",
+          "name": "主页",
+          "type": "webview",
+          "when": "config.nowcoder.interfacePosition == 'right'"
+        }
+      ]
+    },
+    "commands": [],
+    "configuration": {
+      "title": "Nowcoder Helper",
+      "properties": {
+        "nowcoder.defaultLanguage": {
+          "type": "string",
+          "default": "cpp",
+          "enum": [
+            "cpp",
+            "c",
+            "java",
+            "python",
+            "javascript",
+            "go",
+            "rust",
+            "typescript",
+            "swift",
+            "objc",
+            "pascal",
+            "matlab",
+            "bash",
+            "scala",
+            "kotlin",
+            "groovy",
+            "csharp",
+            "php",
+            "r",
+            "ruby"
+          ],
+          "description": "默认提交语言。"
+        },
+        "nowcoder.cLanguage": {
+          "type": "string",
+          "default": "c_gcc10",
+          "enum": [
+            "c_gcc10",
+            "c"
+          ],
+          "description": "提交 .c 文件时使用的 C 语言版本。"
+        },
+        "nowcoder.cppLanguage": {
+          "type": "string",
+          "default": "cpp_clang18",
+          "enum": [
+            "cpp_clang18",
+            "cpp_gnu13"
+          ],
+          "description": "提交 .cpp/.cc/.cxx 文件时使用的 C++ 版本。"
+        },
+        "nowcoder.javaLanguage": {
+          "type": "string",
+          "default": "java",
+          "enum": [
+            "java"
+          ],
+          "description": "提交 .java 文件时使用的 Java 入口。"
+        },
+        "nowcoder.pythonLanguage": {
+          "type": "string",
+          "default": "python3",
+          "enum": [
+            "python3",
+            "python",
+            "pypy2",
+            "pypy3"
+          ],
+          "enumDescriptions": [
+            "普通 .py 文件按 Python3 提交。",
+            "普通 .py 文件按 Python2 提交。",
+            "普通 .py 文件按 pypy2 提交。",
+            "普通 .py 文件按 PyPy3 提交。"
+          ],
+          "description": "普通 .py 文件的提交语言。文件名包含 pypy3 或 pypy 时会自动按 PyPy3 提交。"
+        },
+        "nowcoder.goLanguage": {
+          "type": "string",
+          "default": "go",
+          "enum": [
+            "go"
+          ],
+          "description": "提交 .go 文件时使用的 Go 语言入口。"
+        },
+        "nowcoder.rustLanguage": {
+          "type": "string",
+          "default": "rust",
+          "enum": [
+            "rust"
+          ],
+          "description": "提交 .rs 文件时使用的 Rust 语言入口。"
+        },
+        "nowcoder.javascriptLanguage": {
+          "type": "string",
+          "default": "javascript_v8",
+          "enum": [
+            "javascript_v8",
+            "javascript_node"
+          ],
+          "description": "提交 .js 文件时使用的 JavaScript 语言入口。"
+        },
+        "nowcoder.typescriptLanguage": {
+          "type": "string",
+          "default": "typescript",
+          "enum": [
+            "typescript"
+          ],
+          "description": "提交 .ts 文件时使用的 TypeScript 语言入口。"
+        },
+        "nowcoder.interfacePosition": {
+          "type": "string",
+          "default": "left",
+          "enum": [
+            "left",
+            "right"
+          ],
+          "enumDescriptions": [
+            "显示在左侧牛客插件入口。",
+            "显示在右侧牛客插件入口。"
+          ],
+          "description": "牛客插件入口的显示位置。"
+        },
+        "nowcoder.fileNames": {
+          "type": "array",
+          "default": [
+            "main.cpp",
+            "main.c",
+            "Main.java",
+            "main.py"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "创建比赛题目目录时生成的代码文件名。"
+        },
+        "nowcoder.templates": {
+          "type": "object",
+          "default": {
+            "main.cpp": "#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n    ios::sync_with_stdio(false);\n    cin.tie(nullptr);\n\n    return 0;\n}\n",
+            "main.c": "#include <stdio.h>\n\nint main(void) {\n    return 0;\n}\n",
+            "main.py": "import sys\n\n\ndef solve() -> None:\n    pass\n\n\nif __name__ == \"__main__\":\n    solve()\n",
+            "Main.java": "import java.io.*;\nimport java.util.*;\n\npublic class Main {\n    public static void main(String[] args) throws Exception {\n        FastScanner fs = new FastScanner(System.in);\n    }\n\n    static class FastScanner {\n        private final InputStream in;\n        private final byte[] buffer = new byte[1 << 16];\n        private int ptr = 0, len = 0;\n        FastScanner(InputStream is) { in = is; }\n        private int read() throws IOException {\n            if (ptr >= len) {\n                len = in.read(buffer);\n                ptr = 0;\n                if (len <= 0) return -1;\n            }\n            return buffer[ptr++];\n        }\n        String next() throws IOException {\n            StringBuilder sb = new StringBuilder();\n            int c;\n            do { c = read(); } while (c <= ' ' && c != -1);\n            while (c > ' ') {\n                sb.append((char)c);\n                c = read();\n            }\n            return sb.length() == 0 ? null : sb.toString();\n        }\n    }\n}\n"
+          },
+          "description": "按文件名匹配的模板，支持 {qid}、{title}、{contestId}、{index}、{problemId}、{timeLimit}、{memoryLimit}、{author}、{date}。"
+        },
+        "nowcoder.problemFolderName": {
+          "type": "string",
+          "default": "{index}_{title}",
+          "description": "题目文件夹命名模板。"
+        },
+        "nowcoder.contestFolderName": {
+          "type": "string",
+          "default": "{name}（{contestId}）",
+          "description": "比赛文件夹命名模板。"
+        },
+        "nowcoder.rootPath": {
+          "type": "string",
+          "default": "",
+          "description": "创建比赛目录的根路径。留空时使用当前工作区；例如 ~/Nowcoder。"
+        },
+        "nowcoder.authorName": {
+          "type": "string",
+          "default": "",
+          "description": "写入新建代码文件顶部题目信息块的作者名。留空时显示“用户未配置”。"
+        },
+        "nowcoder.createStatementMarkdown": {
+          "type": "boolean",
+          "default": true,
+          "description": "创建比赛题目目录时生成 statement.md。"
+        },
+        "nowcoder.openCreatedFile": {
+          "type": "boolean",
+          "default": true,
+          "description": "创建比赛目录后自动打开第一个代码文件。"
+        },
+        "nowcoder.pollIntervalMs": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 500,
+          "maximum": 10000,
+          "description": "提交后轮询判题结果的间隔。"
+        },
+        "nowcoder.publicContestCategories": {
+          "type": "array",
+          "default": [
+            13,
+            14,
+            15
+          ],
+          "items": {
+            "type": "number"
+          },
+          "description": "拉取公开比赛时使用的牛客分类 ID。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "check": "node --check extension.js"
+  }
+}

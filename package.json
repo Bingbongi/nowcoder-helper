@@ -2,7 +2,7 @@
   "name": "nowcoder-helper",
   "displayName": "Nowcoder Helper",
   "description": "牛客竞赛 VSCode 助手：登录、公开比赛、报名、创建比赛目录、一键提交、我的比赛提交记录和排行榜。",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "publisher": "local",
   "engines": {
     "vscode": "^1.92.0"
@@ -12,7 +12,27 @@
   ],
   "activationEvents": [
     "onView:nowcoder.app",
-    "onView:nowcoderRight.app"
+    "onView:nowcoderRight.app",
+    "onCommand:nowcoder.open",
+    "onCommand:nowcoder.openLeft",
+    "onCommand:nowcoder.openRight",
+    "onView:nowcoder.contests",
+    "onView:nowcoder.submissions",
+    "onView:nowcoderRight.contests",
+    "onView:nowcoderRight.submissions",
+    "onCommand:nowcoder.login",
+    "onCommand:nowcoder.importBrowserCookie",
+    "onCommand:nowcoder.logout",
+    "onCommand:nowcoder.authCheck",
+    "onCommand:nowcoder.submitCurrentFile",
+    "onCommand:nowcoder.fetchContests",
+    "onCommand:nowcoder.signupContest",
+    "onCommand:nowcoder.signupContestById",
+    "onCommand:nowcoder.prepareContest",
+    "onCommand:nowcoder.showRank",
+    "onCommand:nowcoder.openSubmissionCode",
+    "onCommand:nowcoder.openSettings",
+    "onCommand:nowcoder.contestActions"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -39,6 +59,16 @@
           "name": "主页",
           "type": "webview",
           "when": "config.nowcoder.interfacePosition != 'right'"
+        },
+        {
+          "id": "nowcoder.contests",
+          "name": "公开比赛",
+          "when": "config.nowcoder.interfacePosition != 'right'"
+        },
+        {
+          "id": "nowcoder.submissions",
+          "name": "提交记录",
+          "when": "config.nowcoder.interfacePosition != 'right'"
         }
       ],
       "nowcoderRight": [
@@ -47,10 +77,117 @@
           "name": "主页",
           "type": "webview",
           "when": "config.nowcoder.interfacePosition == 'right'"
+        },
+        {
+          "id": "nowcoderRight.contests",
+          "name": "公开比赛",
+          "when": "config.nowcoder.interfacePosition == 'right'"
+        },
+        {
+          "id": "nowcoderRight.submissions",
+          "name": "提交记录",
+          "when": "config.nowcoder.interfacePosition == 'right'"
         }
       ]
     },
-    "commands": [],
+    "commands": [
+      {
+        "command": "nowcoder.open",
+        "title": "打开主页",
+        "category": "牛客",
+        "icon": "$(home)"
+      },
+      {
+        "command": "nowcoder.openLeft",
+        "title": "打开左侧主页",
+        "category": "牛客",
+        "icon": "$(layout-sidebar-left)"
+      },
+      {
+        "command": "nowcoder.openRight",
+        "title": "打开右侧主页",
+        "category": "牛客",
+        "icon": "$(layout-sidebar-right)"
+      },
+      {
+        "command": "nowcoder.login",
+        "title": "登录账号",
+        "category": "牛客",
+        "icon": "$(sign-in)"
+      },
+      {
+        "command": "nowcoder.importBrowserCookie",
+        "title": "从浏览器导入 Cookie",
+        "category": "牛客",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "nowcoder.logout",
+        "title": "退出登录",
+        "category": "牛客",
+        "icon": "$(sign-out)"
+      },
+      {
+        "command": "nowcoder.authCheck",
+        "title": "检查登录状态",
+        "category": "牛客",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "nowcoder.submitCurrentFile",
+        "title": "提交当前文件",
+        "category": "牛客",
+        "icon": "$(send)"
+      },
+      {
+        "command": "nowcoder.fetchContests",
+        "title": "刷新公开比赛",
+        "category": "牛客",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "nowcoder.signupContest",
+        "title": "报名所选比赛",
+        "category": "牛客",
+        "icon": "$(add)"
+      },
+      {
+        "command": "nowcoder.signupContestById",
+        "title": "按比赛 ID 报名",
+        "category": "牛客",
+        "icon": "$(add)"
+      },
+      {
+        "command": "nowcoder.prepareContest",
+        "title": "创建所选比赛目录",
+        "category": "牛客",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "nowcoder.showRank",
+        "title": "查看所选比赛榜单",
+        "category": "牛客",
+        "icon": "$(list-ordered)"
+      },
+      {
+        "command": "nowcoder.openSubmissionCode",
+        "title": "查看提交代码",
+        "category": "牛客",
+        "icon": "$(code)"
+      },
+      {
+        "command": "nowcoder.openSettings",
+        "title": "打开设置页",
+        "category": "牛客",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "nowcoder.contestActions",
+        "title": "比赛操作",
+        "category": "牛客",
+        "icon": "$(kebab-horizontal)"
+      }
+    ],
     "configuration": {
       "title": "Nowcoder Helper",
       "properties": {
@@ -170,6 +307,27 @@
           ],
           "description": "牛客插件入口的显示位置。"
         },
+        "nowcoder.importBrowser": {
+          "type": "string",
+          "default": "chrome",
+          "enum": [
+            "auto",
+            "chrome",
+            "edge",
+            "brave",
+            "chromium",
+            "arc"
+          ],
+          "enumDescriptions": [
+            "自动按 Chrome、Edge、Brave、Chromium、Arc 顺序查找。",
+            "从 Google Chrome 读取 Cookie。",
+            "从 Microsoft Edge 读取 Cookie。",
+            "从 Brave 读取 Cookie。",
+            "从 Chromium 读取 Cookie。",
+            "从 Arc 读取 Cookie。"
+          ],
+          "description": "从浏览器导入牛客 Cookie 时使用的浏览器。"
+        },
         "nowcoder.fileNames": {
           "type": "array",
           "default": [
@@ -193,6 +351,14 @@
           },
           "description": "按文件名匹配的模板，支持 {qid}、{title}、{contestId}、{index}、{problemId}、{timeLimit}、{memoryLimit}、{author}、{date}。"
         },
+        "nowcoder.deletedTemplates": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "已删除的默认模板文件名。通常由插件设置页维护。"
+        },
         "nowcoder.problemFolderName": {
           "type": "string",
           "default": "{index}_{title}",
@@ -211,7 +377,7 @@
         "nowcoder.authorName": {
           "type": "string",
           "default": "",
-          "description": "写入新建代码文件顶部题目信息块的作者名。留空时显示“用户未配置”。"
+          "description": "写入新建代码文件顶部题目信息块的作者名。留空时优先使用当前登录的牛客用户名。"
         },
         "nowcoder.createStatementMarkdown": {
           "type": "boolean",
@@ -243,9 +409,39 @@
           "description": "拉取公开比赛时使用的牛客分类 ID。"
         }
       }
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "nowcoder.fetchContests",
+          "when": "view == nowcoder.contests || view == nowcoderRight.contests",
+          "group": "navigation"
+        },
+        {
+          "command": "nowcoder.openSettings",
+          "when": "view == nowcoder.app || view == nowcoderRight.app",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "nowcoder.contestActions",
+          "when": "view == nowcoder.contests && viewItem == nowcoderContest || view == nowcoderRight.contests && viewItem == nowcoderContest",
+          "group": "inline"
+        },
+        {
+          "command": "nowcoder.openSubmissionCode",
+          "when": "view == nowcoder.submissions && viewItem == nowcoderSubmission || view == nowcoderRight.submissions && viewItem == nowcoderSubmission",
+          "group": "inline"
+        }
+      ]
     }
   },
   "scripts": {
-    "check": "node --check extension.js"
-  }
+    "check": "node --check extension.js",
+    "package:local": "node scripts/package-local.js",
+    "install:local": "node scripts/install-local.js",
+    "reinstall:local": "npm run package:local && npm run install:local"
+  },
+  "license": "MIT"
 }

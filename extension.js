@@ -31,6 +31,31 @@ const AUTH_CACHE_KEY = "nowcoder.authCache";
 const AUTH_CACHE_TTL_MS = 5 * 60 * 1000;
 const ACCOUNT_SETTINGS_PREFIX = "nowcoder.accountSettings.";
 const DEFAULT_CODE_FILES = ["main.cpp", "main.c", "Main.java", "main.py"];
+const DEFAULT_DELETED_TEMPLATES = [];
+const IMPORT_BROWSER_AUTO = "auto";
+const DEFAULT_IMPORT_BROWSER = "chrome";
+const TEMPLATE_FILE_BY_LANGUAGE = {
+  cpp: "main.cpp",
+  c: "main.c",
+  java: "Main.java",
+  python: "main.py",
+  javascript: "main.js",
+  go: "main.go",
+  rust: "main.rs",
+  typescript: "main.ts",
+  swift: "main.swift",
+  objc: "main.m",
+  pascal: "main.pas",
+  matlab: "main.m",
+  bash: "main.sh",
+  scala: "Main.scala",
+  kotlin: "Main.kt",
+  groovy: "Main.groovy",
+  csharp: "Main.cs",
+  php: "main.php",
+  r: "main.r",
+  ruby: "main.rb"
+};
 const DEFAULT_TEMPLATES = {
   "main.cpp": "#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n    ios::sync_with_stdio(false);\n    cin.tie(nullptr);\n\n    return 0;\n}\n",
   "main.c": "#include <stdio.h>\n\nint main(void) {\n    return 0;\n}\n",
@@ -216,6 +241,10 @@ function activate(context) {
   context.subscriptions.push(output);
   context.subscriptions.push(vscode.window.registerWebviewViewProvider("nowcoder.app", appProvider));
   context.subscriptions.push(vscode.window.registerWebviewViewProvider("nowcoderRight.app", appProvider));
+  context.subscriptions.push(vscode.window.registerTreeDataProvider("nowcoder.contests", contestProvider));
+  context.subscriptions.push(vscode.window.registerTreeDataProvider("nowcoder.submissions", submissionProvider));
+  context.subscriptions.push(vscode.window.registerTreeDataProvider("nowcoderRight.contests", contestProvider));
+  context.subscriptions.push(vscode.window.registerTreeDataProvider("nowcoderRight.submissions", submissionProvider));
   context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(() => {
     if (appProvider) appProvider.postActiveFile();
     if (submissionProvider) submissionProvider.refresh();
@@ -229,6 +258,9 @@ function activate(context) {
   }));
 
   register(context, "nowcoder.login", () => loginCommand(client));
+  register(context, "nowcoder.open", () => openNowcoderCommand());
+  register(context, "nowcoder.openLeft", () => openNowcoderCommand("left", context, client));
+  register(context, "nowcoder.openRight", () => openNowcoderCommand("right", context, client));
   register(context, "nowcoder.importBrowserCookie", () => importBrowserCookieCommand(client));
   register(context, "nowcoder.logout", () => logoutCommand(client));
   register(context, "nowcoder.authCheck", () => authCheckCommand(client));
@@ -547,9 +579,10 @@ class NowcoderClient {
     };
   }
 
-  async importCookieFromBrowser() {
+  async importCookieFromBrowser(browserPreference) {
     const previous = await this.getCookie();
-    const result = await importNowcoderCookieFromBrowsers();
+    const browser = normalizeImportBrowser(browserPreference || config().get("importBrowser", DEFAULT_IMPORT_BROWSER));
+    const result = await importNowcoderCookieFromBrowsers(browser);
     await this.saveCredentials({ cookie: result.cookie });
     const auth = await this.checkAuth().catch(err => ({ acLogin: false, error: err.message }));
     if (!auth.acLogin) {
@@ -1654,6 +1687,7 @@ class SubmissionTreeProvider {
       `内存: ${item.memoryConsumptionKb || "-"}`
     ].join("\n");
     treeItem.iconPath = new vscode.ThemeIcon(statusTone(displayStatus) === "ok" ? "pass" : "warning");
+    treeItem.contextValue = "nowcoderSubmission";
     if (item.submissionId) {
       treeItem.command = {
         command: "nowcoder.openSubmissionCode",
@@ -1705,7 +1739,7 @@ class NowcoderAppProvider {
         await this.withBusy("正在登录...", () => this.client.loginWithPassword(message.payload || {}));
         await this.postState("账号密码登录成功", { forceAuthRefresh: true });
       } else if (message.type === "importBrowserCookie") {
-        const result = await this.withBusy("正在从浏览器导入登录态...", () => this.client.importCookieFromBrowser());
+        const result = await this.withBusy("正在从浏览器导入登录态...", () => this.client.importCookieFromBrowser(message.browser));
         await this.postState(`已从 ${result.browser} 导入登录态`, { forceAuthRefresh: true });
       } else if (message.type === "login") {
         await this.withBusy("正在保存登录信息...", () => this.client.saveCredentials({
@@ -1720,6 +1754,11 @@ class NowcoderAppProvider {
       } else if (message.type === "saveSettings") {
         await this.withBusy("正在保存设置...", () => saveSettingsFromWebview(message.payload || {}, this.context, this.client));
         await this.postState("设置已保存");
+      } else if (message.type === "notify") {
+        const text = String(message.message || "").trim();
+        if (text && message.kind === "error") vscode.window.showErrorMessage(text);
+        else if (text && message.kind === "warning") vscode.window.showWarningMessage(text);
+        else if (text) vscode.window.showInformationMessage(text);
       } else if (message.type === "applyInterfacePosition") {
         const position = await this.withBusy("正在切换界面位置...", () => saveInterfacePosition(message.position, this.context, this.client));
         await this.postState(position === "right" ? "界面已切到右侧" : "界面已切到左侧");
@@ -2144,9 +2183,10 @@ async function logoutCommand(client) {
 
 async function importBrowserCookieCommand(client) {
   try {
+    const browser = normalizeImportBrowser(config().get("importBrowser", DEFAULT_IMPORT_BROWSER));
     const result = await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: "从浏览器导入牛客 Cookie" },
-      () => client.importCookieFromBrowser()
+      { location: vscode.ProgressLocation.Notification, title: `从 ${importBrowserLabel(browser)} 导入牛客 Cookie` },
+      () => client.importCookieFromBrowser(browser)
     );
     vscode.window.showInformationMessage(`已从 ${result.browser} 导入牛客登录态。`);
   } catch (err) {
@@ -2167,6 +2207,19 @@ async function authCheckCommand(client) {
     output.appendLine("== 牛客登录状态 ==");
     output.appendLine(JSON.stringify(result, null, 2));
     vscode.window.showInformationMessage(`判题: ${result.judgeAuth ? "OK" : "未配置/失败"}，比赛登录: ${result.acLogin ? "OK" : "未配置/失败"}`);
+  } catch (err) {
+    showError(err);
+  }
+}
+
+async function openNowcoderCommand(position, context, client) {
+  try {
+    const target = position ? normalizeInterfacePosition(position) : normalizeInterfacePosition(config().get("interfacePosition", "left"));
+    if (position && context && client) {
+      await saveInterfacePosition(target, context, client);
+    } else {
+      await applyInterfacePosition(target);
+    }
   } catch (err) {
     showError(err);
   }
@@ -2450,6 +2503,7 @@ async function prepareContestCommand(context, client, item) {
     await client.requireCookie();
     const root = await pickRootDirectory(context, client);
     if (!root) return;
+    const authorName = await resolveAuthorName(client);
     const contestName = contest.contestName || contest.name || `contest_${contest.contestId}`;
     const contestDirName = applyTemplate(config().get("contestFolderName", "{name}（{contestId}）"), {
       name: contestName,
@@ -2464,7 +2518,7 @@ async function prepareContestCommand(context, client, item) {
         const problems = await client.getContestProblemMappings(contest.contestId, progress);
         const rows = [];
         for (const problem of problems) {
-          const created = await prepareProblemFolder(context, client, normalizeProblemLike({ ...problem, contestName }), contestDir, { open: false, tolerateStatementError: true });
+          const created = await prepareProblemFolder(context, client, normalizeProblemLike({ ...problem, contestName }), contestDir, { open: false, tolerateStatementError: true, authorName });
           rows.push({ ...problem, ...created });
         }
         return rows;
@@ -2527,6 +2581,7 @@ async function openSettingsCommand() {
 
 async function prepareProblemFolder(context, client, problem, baseDir, options = {}) {
   const cfg = config();
+  const authorName = options.authorName !== undefined ? String(options.authorName || "").trim() : await resolveAuthorName(client);
   let question = null;
   let statement = "";
   let statementError = "";
@@ -2576,7 +2631,7 @@ async function prepareProblemFolder(context, client, problem, baseDir, options =
     title: problem.title || question && question.title || "",
     timeLimit: formatTimeLimit(problem, question),
     memoryLimit: formatMemoryLimit(problem, question),
-    author: String(cfg.get("authorName", "") || "").trim() || "用户未配置",
+    author: authorName || "用户未配置",
     date: new Date().toISOString().slice(0, 10)
   };
   const folderPattern = cfg.get("problemFolderName", "{index}_{title}");
@@ -2601,7 +2656,7 @@ async function prepareProblemFolder(context, client, problem, baseDir, options =
   }
 
   const fileNames = ensureCoreCodeFiles(cfg.get("fileNames", DEFAULT_CODE_FILES));
-  const templates = cfg.get("templates", {});
+  const templates = mergeDefaultTemplates(cfg.get("templates", {}), cfg.get("deletedTemplates", DEFAULT_DELETED_TEMPLATES));
   const createdFiles = [];
   for (const fileName of fileNames) {
     const target = path.join(dir, safeRelativeFileName(fileName));
@@ -2642,6 +2697,40 @@ async function prepareProblemFolder(context, client, problem, baseDir, options =
   }
 
   return { dir, files: createdFiles, statementError };
+}
+
+async function resolveAuthorName(client) {
+  const configured = String(config().get("authorName", "") || "").trim();
+  if (configured) return configured;
+  if (!client) return "";
+
+  const cached = await client.getCachedAuth().catch(() => null);
+  const cachedName = authorNameFromAuth(cached);
+  if (cachedName) return cachedName;
+
+  const snapshot = await client.authSnapshotFromCredentials().catch(() => null);
+  const hasCredentials = !!(snapshot && (snapshot.tokenConfigured || snapshot.cookieConfigured || snapshot.account));
+  if (!hasCredentials) return "";
+
+  if (snapshot.tokenConfigured || snapshot.cookieConfigured) {
+    const fresh = await client.checkAuth().catch(err => {
+      if (output) output.appendLine(`自动解析作者名失败：${err.message}`);
+      return null;
+    });
+    const freshName = authorNameFromAuth(fresh);
+    if (freshName) return freshName;
+  }
+
+  return authorNameFromAuth(snapshot);
+}
+
+function authorNameFromAuth(auth) {
+  return cleanHtmlText(firstPresent(
+    auth && auth.userName,
+    auth && auth.nickname,
+    auth && auth.name,
+    auth && auth.account
+  ));
 }
 
 function formatQuestionMarkdown(question) {
@@ -2965,6 +3054,7 @@ function renderNowcoderAppHtml(webview) {
         <div class="grid">
           <label>${label("牛客账号", "填写牛客网页登录使用的邮箱、手机号或账号名。")}<div class="input-wrap" data-icon="@"><input id="account" placeholder="邮箱 / 手机号" autocomplete="username"></div></label>
           <label>${label("牛客密码", "只用于本次登录换取 Cookie，不会保存到 VSCode 存储里。")}<div class="input-wrap" data-icon="*"><input id="password" type="password" placeholder="登录密码" autocomplete="current-password"></div></label>
+          <label>${label("导入浏览器", "选择从哪个浏览器读取 nowcoder.com Cookie；自动会按 Chrome、Edge、Brave、Chromium、Arc 顺序查找。")}<select id="loginImportBrowser">${importBrowserOptions(DEFAULT_IMPORT_BROWSER)}</select></label>
         </div>
         <div class="toolbar">
           <button class="btn-primary" data-action="loginPassword"><span class="btn-icon" aria-hidden="true">✓</span>登录${tip("调用牛客登录接口，成功后保存当前账号的 Cookie。")}</button>
@@ -3064,6 +3154,7 @@ function renderNowcoderAppHtml(webview) {
           <legend>${titled("界面设置", "控制牛客主页显示在 VSCode 左侧活动栏还是右侧辅助侧栏。")}</legend>
           <div class="grid">
             <label>${label("插件位置", "选择插件主页、公开比赛和提交记录视图出现在哪个侧边栏。")}<select id="interfacePosition"><option value="left">左侧</option><option value="right">右侧</option></select></label>
+            <label>${label("导入浏览器", "从浏览器导入登录态时优先读取哪个浏览器；自动会按已支持浏览器顺序查找。")}<select id="importBrowser">${importBrowserOptions(DEFAULT_IMPORT_BROWSER)}</select></label>
           </div>
         </fieldset>
         <fieldset class="setting-group">
@@ -3088,9 +3179,11 @@ function renderNowcoderAppHtml(webview) {
             <label class="wide-field">${label("创建路径", "比赛目录会创建在这个根目录下；留空时使用当前 VSCode 工作区。")}<div class="input-wrap" data-icon="/"><input id="rootPath" placeholder="例如 ~/Nowcoder 或 /Users/me/contests"></div></label>
             <label>${label("题目目录", "单个题目文件夹的命名模板，可使用 {index}、{title}、{qid}、{problemId} 等变量。")}<input id="problemFolderName" placeholder="{index}_{title}"></label>
             <label>${label("比赛目录", "比赛文件夹的命名模板，可使用 {name} 和 {contestId}。")}<input id="contestFolderName" placeholder="{name}（{contestId}）"></label>
-            <label>${label("作者", "写入新建代码文件顶部题目信息块；留空时显示“用户未配置”。")}<input id="authorName" placeholder="用户未配置"></label>
-            <label class="check"><input id="createStatementMarkdown" type="checkbox"><span>生成 statement.md${tip("创建题目目录时同时保存 Markdown 题面，便于离线查看和补充题目元数据。")}</span></label>
-            <label class="check"><input id="openCreatedFile" type="checkbox"><span>打开首个代码文件${tip("创建题目或比赛目录完成后，自动打开第一个生成的代码文件，通常是 main.cpp，方便马上开始写代码。")}</span></label>
+            <label>${label("作者", "写入新建代码文件顶部题目信息块；留空时优先使用当前登录的牛客用户名。")}<input id="authorName" placeholder="留空使用登录用户名"></label>
+            <div class="check-row wide-field">
+              <label class="check"><input id="createStatementMarkdown" type="checkbox"><span>生成 statement.md${tip("创建题目目录时同时保存 Markdown 题面，便于离线查看和补充题目元数据。")}</span></label>
+              <label class="check"><input id="openCreatedFile" type="checkbox"><span>打开首个代码文件${tip("创建题目或比赛目录完成后，自动打开第一个生成的代码文件，通常是 main.cpp，方便马上开始写代码。")}</span></label>
+            </div>
           </div>
           <div class="example-box">
             <strong>示例</strong>
@@ -3098,10 +3191,21 @@ function renderNowcoderAppHtml(webview) {
             <div class="meta">比赛目录：{name}（{contestId}）</div>
             <div class="meta">最终路径：~/Nowcoder/牛客周赛 Round 144（134957）/A_题目名/main.cpp / main.c / Main.java / main.py</div>
           </div>
-          <label>${label("代码文件名", "创建每道题时生成的代码文件列表，每行一个；插件会确保 main.cpp、main.c、Main.java、main.py 这些核心文件存在。")}<textarea id="fileNames" placeholder="main.cpp&#10;main.c&#10;Main.java&#10;main.py"></textarea></label>
+          <textarea id="fileNames" class="hidden" aria-hidden="true"></textarea>
         </fieldset>
         <fieldset class="setting-group">
           <legend>${titled("模板", "按文件名配置新建代码文件的初始内容，模板变量会在创建目录时替换。")}</legend>
+          <div class="template-builder">
+            <div class="grid">
+              <label>${label("语言", "选择模板对应的语言；插件会按语言填入一个常用代码文件名，你也可以自行修改。")}<select id="templateLanguage">${languageOptions("cpp")}</select></label>
+              <label>${label("代码文件名", "这个文件名会加入创建题目时生成的代码文件列表，并作为模板匹配键。")}<div class="input-wrap" data-icon="{}"><input id="templateFileName" placeholder="main.cpp"></div></label>
+            </div>
+            <label>${label("模板内容", "填写新建代码文件的初始内容；支持 {qid}、{title}、{contestId}、{index}、{problemId}、{timeLimit}、{memoryLimit}、{author}、{date}。")}<textarea id="templateContent" placeholder="#include &lt;bits/stdc++.h&gt;&#10;using namespace std;&#10;&#10;int main() {&#10;    ios::sync_with_stdio(false);&#10;    cin.tie(nullptr);&#10;    return 0;&#10;}"></textarea></label>
+            <div class="toolbar compact">
+              <button class="btn-secondary" data-action="addTemplate"><span class="btn-icon" aria-hidden="true">+</span>添加/更新模板${tip("按当前文件名创建或更新模板，并同步加入代码文件名列表。")}</button>
+              <button class="btn-danger" data-action="deleteTemplate"><span class="btn-icon" aria-hidden="true">×</span>删除当前模板${tip("删除当前文件名对应的模板；保存设置后才会永久生效。")}</button>
+            </div>
+          </div>
           <div class="tabs" id="templateTabs"></div>
           <div id="templateAreas"></div>
         </fieldset>
@@ -3116,8 +3220,17 @@ function renderNowcoderAppHtml(webview) {
       let autoSubmissionTimer = null;
       let lastAutoSubmissionContestId = '';
       let autoContestsRequested = false;
+      let deletedTemplates = [];
       const $ = id => document.getElementById(id);
       const post = (type, payload = {}) => vscode.postMessage({ type, ...payload });
+      const templateFileByLanguage = ${JSON.stringify(TEMPLATE_FILE_BY_LANGUAGE)};
+      const defaultTemplateByFile = ${JSON.stringify(DEFAULT_TEMPLATES)};
+      const templateLanguageByExtension = {
+        c: 'c', cc: 'cpp', cpp: 'cpp', cxx: 'cpp', java: 'java', py: 'python',
+        js: 'javascript', go: 'go', rs: 'rust', ts: 'typescript', swift: 'swift',
+        m: 'objc', mm: 'objc', pas: 'pascal', sh: 'bash', scala: 'scala',
+        kt: 'kotlin', groovy: 'groovy', cs: 'csharp', php: 'php', r: 'r', rb: 'ruby'
+      };
       $('submissionContestSearch').addEventListener('input', () => {
         renderSubmissionContestOptions();
         const typed = (($('submissionContestSearch') && $('submissionContestSearch').value) || '').trim();
@@ -3156,6 +3269,10 @@ function renderNowcoderAppHtml(webview) {
       $('interfacePosition').addEventListener('change', () => {
         post('applyInterfacePosition', { position: $('interfacePosition').value });
       });
+      $('importBrowser').addEventListener('change', () => syncImportBrowserSelects('settings'));
+      $('loginImportBrowser').addEventListener('change', () => syncImportBrowserSelects('login'));
+      $('templateLanguage').addEventListener('change', () => seedTemplateDraftForLanguage(true));
+      $('templateFileName').addEventListener('blur', () => loadTemplateDraft($('templateFileName').value));
 
       document.querySelectorAll('[data-action]').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -3170,6 +3287,10 @@ function renderNowcoderAppHtml(webview) {
           } else if (action === 'saveSettings') {
             showNotice('正在保存设置...', 'loading');
             post('saveSettings', { payload: collectSettings() });
+          } else if (action === 'addTemplate') {
+            addOrUpdateTemplate();
+          } else if (action === 'deleteTemplate') {
+            deleteCurrentTemplate();
           } else if (action === 'loadSubmissionRecords') {
             lastAutoSubmissionContestId = '';
             loadSelectedSubmissionRecords(true);
@@ -3187,6 +3308,8 @@ function renderNowcoderAppHtml(webview) {
           } else if (action === 'showLogin') {
             state.showLogin = !state.showLogin;
             renderLoginVisibility(!!(state.auth && (state.auth.tokenConfigured || state.auth.cookieConfigured)));
+          } else if (action === 'importBrowserCookie') {
+            post('importBrowserCookie', { browser: selectedImportBrowser() });
           } else {
             post(action);
           }
@@ -3298,6 +3421,11 @@ function renderNowcoderAppHtml(webview) {
         const el = $('notice');
         el.textContent = message;
         el.className = 'notice ' + (kind || 'info');
+      }
+
+      function notify(message, kind) {
+        hideNotice();
+        post('notify', { message, kind: kind || 'info' });
       }
 
       function hideNotice() {
@@ -3541,6 +3669,8 @@ function renderNowcoderAppHtml(webview) {
 
       function renderSettings(s) {
         $('interfacePosition').value = s.interfacePosition || 'left';
+        $('importBrowser').value = s.importBrowser || 'chrome';
+        $('loginImportBrowser').value = s.importBrowser || 'chrome';
         $('defaultLanguage').value = s.defaultLanguage || 'cpp';
         $('cLanguage').value = s.cLanguage || 'c_gcc10';
         $('cppLanguage').value = s.cppLanguage || 'cpp_clang18';
@@ -3559,7 +3689,9 @@ function renderNowcoderAppHtml(webview) {
         $('createStatementMarkdown').checked = s.createStatementMarkdown !== false;
         $('openCreatedFile').checked = s.openCreatedFile !== false;
         $('fileNames').value = joinLines(s.fileNames || ['main.cpp', 'main.c', 'Main.java', 'main.py']);
+        deletedTemplates = Array.isArray(s.deletedTemplates) ? s.deletedTemplates.slice() : [];
         renderTemplates(s.templates || {});
+        seedTemplateDraftForLanguage(false);
       }
 
       function renderSubmitPanel() {
@@ -3613,7 +3745,7 @@ function renderNowcoderAppHtml(webview) {
       }
 
       function renderTemplateEditor(name, value, active) {
-        if (!name || document.querySelector('.template[data-name="' + cssName(name) + '"]')) return;
+        if (!name || templateAreaByName(name)) return;
         const tab = document.createElement('button');
         tab.className = 'tab' + (active ? ' active' : '');
         tab.innerHTML = '<span class="tab-name">' + esc(name) + '</span>';
@@ -3631,13 +3763,140 @@ function renderNowcoderAppHtml(webview) {
         document.querySelectorAll('.tab,.template').forEach(el => el.classList.remove('active'));
         document.querySelectorAll('.tab').forEach(el => { if (el.dataset.name === name) el.classList.add('active'); });
         document.querySelectorAll('.template').forEach(el => { if (el.dataset.name === name) el.classList.add('active'); });
+        loadTemplateDraft(name);
+      }
+
+      function addOrUpdateTemplate() {
+        const name = normalizeTemplateFileName($('templateFileName').value);
+        if (!name) {
+          notify('请输入代码文件名。', 'warning');
+          return;
+        }
+        $('templateFileName').value = name;
+        deletedTemplates = deletedTemplates.filter(item => item.toLowerCase() !== name.toLowerCase());
+        const existing = templateAreaByName(name);
+        if (existing) {
+          existing.value = $('templateContent').value;
+        } else {
+          renderTemplateEditor(name, $('templateContent').value, true);
+        }
+        ensureFileNameInList(name);
+        activateTemplate(name);
+        notify('模板已加入当前设置：' + name);
+      }
+
+      function deleteCurrentTemplate() {
+        const active = document.querySelector('.template.active');
+        const name = normalizeTemplateFileName($('templateFileName').value || (active && active.dataset.name));
+        if (!name) {
+          notify('请选择或输入要删除的模板文件名。', 'warning');
+          return;
+        }
+        const area = templateAreaByName(name);
+        const tab = templateTabByName(name);
+        if (!area && !defaultTemplateByFile[name]) {
+          notify('当前没有这个模板：' + name, 'warning');
+          return;
+        }
+        if (!deletedTemplates.some(item => item.toLowerCase() === name.toLowerCase())) {
+          deletedTemplates.push(name);
+        }
+        if (area) area.remove();
+        if (tab) tab.remove();
+        removeFileNameFromList(name);
+        const next = document.querySelector('.tab');
+        if (next) {
+          activateTemplate(next.dataset.name);
+          loadTemplateDraft(next.dataset.name);
+        } else {
+          $('templateFileName').value = name;
+          $('templateContent').value = '';
+        }
+        notify('模板已从当前设置中删除：' + name + '，保存设置后生效。');
+      }
+
+      function seedTemplateDraftForLanguage(forceName) {
+        const lang = $('templateLanguage').value || 'cpp';
+        const name = templateFileByLanguage[lang] || ('main.' + lang);
+        if (forceName || !normalizeTemplateFileName($('templateFileName').value)) {
+          $('templateFileName').value = name;
+        }
+        loadTemplateDraft($('templateFileName').value, lang);
+      }
+
+      function loadTemplateDraft(fileName, preferredLanguage) {
+        const name = normalizeTemplateFileName(fileName);
+        if (!name) return;
+        $('templateFileName').value = name;
+        const lang = preferredLanguage || inferTemplateLanguage(name);
+        if (lang && $('templateLanguage').querySelector('option[value="' + lang + '"]')) {
+          $('templateLanguage').value = lang;
+        }
+        const existing = templateAreaByName(name);
+        $('templateContent').value = existing ? existing.value : defaultTemplateForFile(name);
+      }
+
+      function ensureFileNameInList(name) {
+        const files = splitLines($('fileNames').value);
+        if (!files.some(item => item.toLowerCase() === name.toLowerCase())) {
+          files.push(name);
+          $('fileNames').value = joinLines(files);
+        }
+      }
+
+      function removeFileNameFromList(name) {
+        const key = String(name || '').toLowerCase();
+        const core = ['main.cpp', 'main.c', 'main.java', 'main.py'];
+        if (core.includes(key)) return;
+        const files = splitLines($('fileNames').value).filter(item => item.toLowerCase() !== key);
+        $('fileNames').value = joinLines(files);
+      }
+
+      function templateAreaByName(name) {
+        return Array.from(document.querySelectorAll('.template')).find(area => area.dataset.name === name) || null;
+      }
+
+      function templateTabByName(name) {
+        return Array.from(document.querySelectorAll('.tab')).find(tab => tab.dataset.name === name) || null;
+      }
+
+      function defaultTemplateForFile(name) {
+        if (defaultTemplateByFile[name] !== undefined) return defaultTemplateByFile[name];
+        const ext = fileExtension(name);
+        const fallback = { c: 'main.c', cc: 'main.cpp', cpp: 'main.cpp', cxx: 'main.cpp', java: 'Main.java', py: 'main.py' }[ext];
+        return fallback && defaultTemplateByFile[fallback] !== undefined ? defaultTemplateByFile[fallback] : '';
+      }
+
+      function inferTemplateLanguage(name) {
+        const direct = Object.keys(templateFileByLanguage).find(lang => templateFileByLanguage[lang].toLowerCase() === String(name || '').toLowerCase());
+        return direct || templateLanguageByExtension[fileExtension(name)] || 'cpp';
+      }
+
+      function normalizeTemplateFileName(value) {
+        return String(value || '')
+          .split(String.fromCharCode(92)).join('/')
+          .split('/')
+          .map(part => part.trim())
+          .filter(Boolean)
+          .join('/');
+      }
+
+      function fileExtension(name) {
+        const file = String(name || '').split('/').pop() || '';
+        const index = file.lastIndexOf('.');
+        return index >= 0 ? file.slice(index + 1).toLowerCase() : '';
       }
 
       function collectSettings() {
         const templates = {};
         document.querySelectorAll('.template').forEach(area => templates[area.dataset.name] = area.value);
+        Object.keys(templates).forEach(name => {
+          deletedTemplates = deletedTemplates.filter(item => item.toLowerCase() !== name.toLowerCase());
+        });
+        const fileNames = mergeFileNamesFromTemplates(splitLines($('fileNames').value), Object.keys(templates), deletedTemplates);
         return {
           interfacePosition: $('interfacePosition').value,
+          importBrowser: selectedImportBrowser(),
           defaultLanguage: $('defaultLanguage').value,
           cLanguage: $('cLanguage').value,
           cppLanguage: $('cppLanguage').value,
@@ -3655,9 +3914,24 @@ function renderNowcoderAppHtml(webview) {
           publicContestCategories: $('publicContestCategories').value.split(',').map(s => Number(s.trim())).filter(Boolean),
           createStatementMarkdown: $('createStatementMarkdown').checked,
           openCreatedFile: $('openCreatedFile').checked,
-          fileNames: splitLines($('fileNames').value),
-          templates
+          fileNames,
+          templates,
+          deletedTemplates: deletedTemplates.slice()
         };
+      }
+
+      function mergeFileNamesFromTemplates(savedFiles, templateNames, deletedNames) {
+        const deleted = new Set((deletedNames || []).map(name => String(name || '').toLowerCase()));
+        const seen = new Set();
+        const files = [];
+        ['main.cpp', 'main.c', 'Main.java', 'main.py'].concat(templateNames || [], savedFiles || []).forEach(name => {
+          const value = normalizeTemplateFileName(name);
+          const key = value.toLowerCase();
+          if (!value || seen.has(key) || deleted.has(key)) return;
+          seen.add(key);
+          files.push(value);
+        });
+        return files;
       }
 
       function formatTime(value) {
@@ -3767,6 +4041,12 @@ function renderNowcoderAppHtml(webview) {
         const normalized = String(value || '').split(String.fromCharCode(92, 110)).join(String.fromCharCode(10));
         return normalized.split(/\\r?\\n/).map(s => s.trim()).filter(Boolean);
       }
+      function selectedImportBrowser() { return ($('loginImportBrowser') && $('loginImportBrowser').value) || ($('importBrowser') && $('importBrowser').value) || 'chrome'; }
+      function syncImportBrowserSelects(source) {
+        const value = source === 'login' ? $('loginImportBrowser').value : $('importBrowser').value;
+        $('loginImportBrowser').value = value;
+        $('importBrowser').value = value;
+      }
       function cssName(name) { return String(name).replace(/"/g, '\\\\"'); }
       function esc(s) { return String(s ?? '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch])); }
       function helpTip(s) { return '<span class="help-tip" tabindex="0" aria-label="' + esc(s) + '" data-tip="' + esc(s) + '">?</span>'; }
@@ -3791,23 +4071,25 @@ function baseHtml(body, options = {}) {
   <meta http-equiv="Content-Security-Policy" content="${csp}">
   <style nonce="${nonce}">
     :root { color-scheme: light dark; }
+    html, body { box-sizing: border-box; width: 100%; max-width: 100%; overflow-x: hidden; overscroll-behavior-x: none; }
+    *, *::before, *::after { box-sizing: inherit; }
     body { margin: 0; color: var(--vscode-foreground); background: var(--vscode-editor-background); font-family: var(--vscode-font-family); font-size: 12px; line-height: 1.38; scrollbar-width: thin; }
     ::-webkit-scrollbar { width: 8px; height: 8px; }
     ::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 10px; border: 2px solid transparent; background-clip: padding-box; }
     ::-webkit-scrollbar-thumb:hover { background: var(--vscode-scrollbarSlider-hoverBackground); border: 2px solid transparent; background-clip: padding-box; }
-    main { box-sizing: border-box; width: 100%; min-width: 0; padding: 7px; margin: 0; }
-    header { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+    main { width: 100%; max-width: 100vw; min-width: 0; overflow-x: hidden; overflow-x: clip; padding: 7px; margin: 0; }
+    header { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; min-width: 0; max-width: 100%; margin-bottom: 8px; }
     .app-header { align-items: center; justify-content: flex-start; }
     .brand-mark { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 6px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); font-size: 14px; font-weight: 750; box-shadow: 0 4px 12px rgba(0,0,0,.14); }
     h1 { font-size: 18px; margin: 0; font-weight: 650; }
     h2 { font-size: 14px; margin: 0; font-weight: 650; }
     .meta { color: var(--vscode-descriptionForeground); font-size: 11px; }
-    .toolbar { display: flex; gap: 4px; margin-bottom: 6px; flex-wrap: wrap; }
+    .toolbar { display: flex; gap: 4px; min-width: 0; max-width: 100%; margin-bottom: 6px; flex-wrap: wrap; }
     .toolbar.compact { margin: 5px 0 0; }
-    .toolbar.inline-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(58px, 1fr)); gap: 4px; width: 100%; margin: 0; }
+    .toolbar.inline-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(58px, 100%), 1fr)); gap: 4px; width: 100%; margin: 0; }
     .toolbar.inline-actions button { width: 100%; min-width: 0; }
     .toolbar:last-child { margin-bottom: 0; }
-    button { box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; gap: 4px; border: 1px solid var(--vscode-button-border, transparent); background: var(--vscode-button-background); color: var(--vscode-button-foreground); padding: 4px 7px; border-radius: 5px; cursor: pointer; min-height: 28px; min-width: 0; font: inherit; font-weight: 550; white-space: normal; line-height: 1.22; text-align: center; transition: background .14s ease, border-color .14s ease, color .14s ease, opacity .14s ease; }
+    button { display: inline-flex; align-items: center; justify-content: center; gap: 4px; border: 1px solid var(--vscode-button-border, transparent); background: var(--vscode-button-background); color: var(--vscode-button-foreground); padding: 4px 7px; border-radius: 5px; cursor: pointer; min-height: 28px; min-width: 0; max-width: 100%; font: inherit; font-weight: 550; white-space: normal; overflow-wrap: anywhere; line-height: 1.22; text-align: center; transition: background .14s ease, border-color .14s ease, color .14s ease, opacity .14s ease; }
     button:hover { background: var(--vscode-button-hoverBackground); }
     button:focus-visible { outline: 1px solid var(--vscode-focusBorder, #3b82f6); outline-offset: 2px; }
     button:disabled { opacity: .50; cursor: not-allowed; transform: none; filter: grayscale(.4); border-style: dashed; box-shadow: none; }
@@ -3830,7 +4112,7 @@ function baseHtml(body, options = {}) {
     .mini-icon { width: 12px; height: 12px; color: var(--vscode-descriptionForeground); font-size: 9px; }
     .main-tab, .tab { background: var(--vscode-editorWidget-background); color: var(--vscode-foreground); border-color: var(--vscode-panel-border); }
     .main-tab:hover, .tab:hover { background: var(--vscode-list-hoverBackground); }
-    .table-wrap { overflow: auto; border: 1px solid var(--vscode-panel-border); border-radius: 8px; box-shadow: inset 0 1px 0 rgba(255,255,255,.03); }
+    .table-wrap { width: 100%; max-width: 100%; min-width: 0; overflow-x: auto; overflow-y: hidden; border: 1px solid var(--vscode-panel-border); border-radius: 8px; box-shadow: inset 0 1px 0 rgba(255,255,255,.03); }
     table { width: 100%; border-collapse: collapse; table-layout: auto; background: var(--vscode-editor-background); }
     th, td { border-bottom: 1px solid var(--vscode-panel-border); padding: 7px 8px; text-align: left; white-space: nowrap; }
     th { position: sticky; top: 0; z-index: 1; color: var(--vscode-descriptionForeground); font-weight: 600; background: var(--vscode-editorWidget-background); }
@@ -3844,12 +4126,12 @@ function baseHtml(body, options = {}) {
     .rank-cell { font-weight: 650; }
     .score-ok { color: var(--vscode-testing-iconPassed, #2ea043); font-weight: 650; }
     .score-mid { color: var(--vscode-editorWarning-foreground, #d29922); font-weight: 650; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); gap: 6px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(112px, 100%), 1fr)); gap: 6px; min-width: 0; max-width: 100%; }
     .grid .wide-field { grid-column: 1 / -1; }
-    label { display: grid; gap: 4px; font-size: 12px; color: var(--vscode-descriptionForeground); }
+    label { display: grid; gap: 4px; min-width: 0; max-width: 100%; font-size: 12px; color: var(--vscode-descriptionForeground); }
     label > span { color: var(--vscode-descriptionForeground); font-weight: 600; }
     label > span::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 2px; background: var(--vscode-button-background); vertical-align: 1px; }
-    .label-text { display: inline-flex; align-items: center; gap: 4px; min-width: 0; width: fit-content; }
+    .label-text { display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 100%; width: fit-content; overflow-wrap: anywhere; }
     .help-tip { position: relative; display: inline-grid; place-items: center; flex: 0 0 auto; width: 16px; height: 16px; border: 1px solid color-mix(in srgb, currentColor 40%, var(--vscode-panel-border)); border-radius: 50%; color: var(--vscode-descriptionForeground); background: color-mix(in srgb, var(--vscode-editorWidget-background) 78%, transparent); font-size: 11px; font-weight: 750; line-height: 1; cursor: help; vertical-align: middle; }
     .help-tip::after { content: attr(data-tip); position: absolute; left: 50%; bottom: calc(100% + 8px); z-index: 50; width: max-content; max-width: min(220px, calc(100vw - 28px)); padding: 6px 8px; border: 1px solid var(--vscode-panel-border); border-radius: 6px; color: var(--vscode-foreground); background: var(--vscode-editorWidget-background); box-shadow: 0 8px 22px rgba(0,0,0,.22); font-size: 11px; font-weight: 400; line-height: 1.38; text-align: left; white-space: normal; overflow-wrap: break-word; opacity: 0; transform: translate(-50%, 3px); pointer-events: none; transition: opacity .12s ease, transform .12s ease; }
     .help-tip:hover, .help-tip:focus-visible { color: var(--vscode-textLink-foreground, #58a6ff); border-color: color-mix(in srgb, var(--vscode-textLink-foreground, #58a6ff) 54%, var(--vscode-panel-border)); outline: none; }
@@ -3857,17 +4139,18 @@ function baseHtml(body, options = {}) {
     button .help-tip, summary .help-tip, h2 .help-tip, legend .help-tip { margin-left: 4px; }
     button .help-tip { width: 15px; height: 15px; color: currentColor; opacity: .78; background: color-mix(in srgb, currentColor 10%, transparent); }
     label.check { display: inline-flex; align-items: center; justify-content: flex-start; gap: 5px; width: fit-content; min-height: 22px; padding: 0; color: var(--vscode-foreground); background: transparent; border: 0; }
+    .check-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; min-width: 0; max-width: 100%; margin-top: 2px; }
     label.check span::before { display: none; }
     label.check input { width: 14px; height: 14px; min-height: 0; margin: 0; flex: 0 0 auto; }
-    input, select, textarea { box-sizing: border-box; width: 100%; min-height: 28px; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, #6b7280)); background: var(--vscode-input-background); color: var(--vscode-input-foreground); border-radius: 6px; padding: 5px 6px; font: inherit; transition: border-color .16s ease, box-shadow .16s ease, background .16s ease; }
+    input, select, textarea { width: 100%; max-width: 100%; min-width: 0; min-height: 28px; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, #6b7280)); background: var(--vscode-input-background); color: var(--vscode-input-foreground); border-radius: 6px; padding: 5px 6px; font: inherit; transition: border-color .16s ease, box-shadow .16s ease, background .16s ease; }
     input::placeholder, textarea::placeholder { color: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground)); opacity: 1; }
     input:focus, select:focus, textarea:focus { outline: none; border-color: var(--vscode-focusBorder, #3b82f6); box-shadow: 0 0 0 2px color-mix(in srgb, var(--vscode-focusBorder, #3b82f6) 22%, transparent); }
     textarea { min-height: 110px; resize: vertical; font-family: var(--vscode-editor-font-family); }
-    .input-wrap { position: relative; }
+    .input-wrap { position: relative; min-width: 0; max-width: 100%; }
     .input-wrap::before { content: attr(data-icon); position: absolute; left: 7px; top: 50%; transform: translateY(-50%); display: grid; place-items: center; width: 16px; height: 16px; border-radius: 4px; color: var(--vscode-descriptionForeground); background: color-mix(in srgb, var(--vscode-descriptionForeground) 10%, transparent); font-size: 10px; font-weight: 750; pointer-events: none; }
     .input-wrap input { padding-left: 30px; }
-    .tabs { display: flex; gap: 3px; flex-wrap: wrap; margin-bottom: 8px; padding-bottom: 1px; border-bottom: 1px solid var(--vscode-panel-border); }
-    .submission-picker { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; align-items: end; gap: 6px; margin-bottom: 7px; }
+    .tabs { display: flex; gap: 3px; flex-wrap: wrap; min-width: 0; max-width: 100%; margin-bottom: 8px; padding-bottom: 1px; border-bottom: 1px solid var(--vscode-panel-border); }
+    .submission-picker { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, auto); align-items: end; gap: 6px; min-width: 0; max-width: 100%; margin-bottom: 7px; }
     .submission-picker button { min-height: 28px; white-space: nowrap; }
     .contest-id-box { display: grid; grid-template-columns: 1fr; gap: 6px; margin-bottom: 7px; }
     .contest-id-box .inline-actions { align-items: center; }
@@ -3881,26 +4164,26 @@ function baseHtml(body, options = {}) {
     .template { display: none; min-height: 260px; line-height: 1.42; }
     .template.active { display: block; }
     .hidden { display: none !important; }
-    .surface, .panel { border: 1px solid var(--vscode-panel-border); border-radius: 7px; padding: 7px; margin-bottom: 7px; background: color-mix(in srgb, var(--vscode-editorWidget-background, var(--vscode-editor-background)) 52%, var(--vscode-editor-background)); box-shadow: 0 1px 0 rgba(0,0,0,.08); }
-    .section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid var(--vscode-panel-border); }
+    .surface, .panel { min-width: 0; max-width: 100%; overflow-x: hidden; overflow-x: clip; border: 1px solid var(--vscode-panel-border); border-radius: 7px; padding: 7px; margin-bottom: 7px; background: color-mix(in srgb, var(--vscode-editorWidget-background, var(--vscode-editor-background)) 52%, var(--vscode-editor-background)); box-shadow: 0 1px 0 rgba(0,0,0,.08); }
+    .section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; min-width: 0; max-width: 100%; margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid var(--vscode-panel-border); }
     .section-head.inline-head { margin-top: 9px; }
-    .main-tabs { display: grid; grid-template-columns: repeat(auto-fit, minmax(50px, 1fr)); gap: 3px; margin: 6px 0 7px; }
+    .main-tabs { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(50px, 100%), 1fr)); gap: 3px; min-width: 0; max-width: 100%; margin: 6px 0 7px; }
     .main-tab { width: 100%; }
     .main-tab.active { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: var(--vscode-button-border, transparent); box-shadow: 0 5px 14px rgba(0,0,0,.12); }
-    .segmented { display: grid; grid-template-columns: repeat(auto-fit, minmax(58px, 1fr)); gap: 3px; margin: 6px 0 7px; padding: 3px; border: 1px solid var(--vscode-panel-border); border-radius: 7px; background: color-mix(in srgb, var(--vscode-editorWidget-background) 70%, transparent); }
+    .segmented { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(58px, 100%), 1fr)); gap: 3px; min-width: 0; max-width: 100%; margin: 6px 0 7px; padding: 3px; border: 1px solid var(--vscode-panel-border); border-radius: 7px; background: color-mix(in srgb, var(--vscode-editorWidget-background) 70%, transparent); }
     .segment { min-width: 0; background: transparent; color: var(--vscode-descriptionForeground); border-color: transparent; box-shadow: none; }
     .segment:hover { background: var(--vscode-list-hoverBackground); box-shadow: none; }
     .segment.active { color: var(--vscode-button-foreground); background: var(--vscode-button-background); border-color: var(--vscode-button-border, transparent); box-shadow: 0 4px 12px rgba(0,0,0,.12); }
     .segment span { display: inline-grid; place-items: center; min-width: 20px; height: 20px; border-radius: 999px; padding: 0 6px; background: color-mix(in srgb, currentColor 14%, transparent); font-size: 12px; line-height: 1; }
-    .list { display: grid; gap: 6px; }
-    .item { display: grid; gap: 6px; border: 1px solid var(--vscode-panel-border); border-radius: 7px; padding: 7px; background: var(--vscode-editorWidget-background); transition: border-color .16s ease, background .16s ease, transform .16s ease, box-shadow .16s ease; }
+    .list { display: grid; gap: 6px; min-width: 0; max-width: 100%; }
+    .item { display: grid; gap: 6px; min-width: 0; max-width: 100%; overflow-x: hidden; overflow-x: clip; border: 1px solid var(--vscode-panel-border); border-radius: 7px; padding: 7px; background: var(--vscode-editorWidget-background); transition: border-color .16s ease, background .16s ease, transform .16s ease, box-shadow .16s ease; }
     .item:hover { border-color: var(--vscode-focusBorder, var(--vscode-panel-border)); transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,0,0,.10); }
-    .row { display: flex; gap: 5px; flex-wrap: wrap; }
-    .card-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(58px, 1fr)); }
+    .row { display: flex; gap: 5px; flex-wrap: wrap; min-width: 0; max-width: 100%; }
+    .card-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(58px, 100%), 1fr)); min-width: 0; max-width: 100%; }
     .card-actions button { width: 100%; }
     .empty { color: var(--vscode-descriptionForeground); font-size: 12px; padding: 8px 0; }
     .empty.muted { padding: 6px 0 2px; }
-    .empty-state { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 6px; border: 1px dashed var(--vscode-panel-border); border-radius: 7px; padding: 8px; color: var(--vscode-descriptionForeground); background: var(--vscode-editorWidget-background); }
+    .empty-state { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 6px; min-width: 0; max-width: 100%; border: 1px dashed var(--vscode-panel-border); border-radius: 7px; padding: 8px; color: var(--vscode-descriptionForeground); background: var(--vscode-editorWidget-background); }
     .empty-state.no-icon { grid-template-columns: minmax(0, 1fr) auto; }
     .empty-copy { display: grid; gap: 3px; min-width: 0; }
     .empty-copy strong { color: var(--vscode-foreground); font-size: 13px; }
@@ -3921,10 +4204,10 @@ function baseHtml(body, options = {}) {
     .status-dot.ok { background: var(--vscode-testing-iconPassed, #2ea043); }
     .status-dot.warn { background: var(--vscode-editorWarning-foreground, #d29922); }
     .status-dot.bad { background: var(--vscode-errorForeground, #f85149); }
-    .contest-group { display: grid; gap: 6px; }
+    .contest-group { display: grid; gap: 6px; min-width: 0; max-width: 100%; }
     .contest-group + .contest-group { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--vscode-panel-border); }
-    .group-title { display: flex; align-items: center; justify-content: space-between; gap: 6px; color: var(--vscode-foreground); font-size: 13px; font-weight: 650; padding: 2px 0; }
-    .group-label { display: inline-flex; align-items: center; gap: 6px; }
+    .group-title { display: flex; align-items: center; justify-content: space-between; gap: 6px; min-width: 0; max-width: 100%; color: var(--vscode-foreground); font-size: 13px; font-weight: 650; padding: 2px 0; }
+    .group-label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
     .group-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 16%, transparent); }
     .contest-group.running .group-title { color: var(--vscode-testing-iconPassed, #2ea043); }
     .contest-group.future .group-title { color: var(--vscode-textLink-foreground, #58a6ff); }
@@ -3941,19 +4224,19 @@ function baseHtml(body, options = {}) {
     .history-card.submission-info { border-left-color: var(--vscode-textLink-foreground, #58a6ff); background: color-mix(in srgb, var(--vscode-textLink-foreground, #58a6ff) 5%, var(--vscode-editorWidget-background)); }
     .history-card.submission-muted { border-left-color: var(--vscode-descriptionForeground); }
     .submit-result { margin: 7px 0 10px; }
-    .submit-result-card { display: grid; gap: 6px; padding: 7px; border: 1px solid var(--vscode-panel-border); border-left-width: 3px; border-radius: 7px; background: var(--vscode-editorWidget-background); }
+    .submit-result-card { display: grid; gap: 6px; min-width: 0; max-width: 100%; padding: 7px; border: 1px solid var(--vscode-panel-border); border-left-width: 3px; border-radius: 7px; background: var(--vscode-editorWidget-background); }
     .submit-result-ok .submit-result-card { border-left-color: var(--vscode-testing-iconPassed, #2ea043); background: color-mix(in srgb, var(--vscode-testing-iconPassed, #2ea043) 5%, var(--vscode-editorWidget-background)); }
     .submit-result-bad .submit-result-card { border-left-color: var(--vscode-errorForeground, #f85149); background: color-mix(in srgb, var(--vscode-errorForeground, #f85149) 4%, var(--vscode-editorWidget-background)); }
     .submit-result-warn .submit-result-card { border-left-color: var(--vscode-editorWarning-foreground, #d29922); background: color-mix(in srgb, var(--vscode-editorWarning-foreground, #d29922) 5%, var(--vscode-editorWidget-background)); }
     .submit-result-info .submit-result-card { border-left-color: var(--vscode-textLink-foreground, #58a6ff); background: color-mix(in srgb, var(--vscode-textLink-foreground, #58a6ff) 5%, var(--vscode-editorWidget-background)); }
     .submit-result-muted .submit-result-card { border-left-color: var(--vscode-descriptionForeground); }
     .submit-result-message { margin-top: 5px; color: var(--vscode-descriptionForeground); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
-    .submit-panel { display: grid; gap: 6px; margin-bottom: 7px; padding: 7px; border: 1px solid var(--vscode-panel-border); border-radius: 7px; background: var(--vscode-editorWidget-background); }
-    .submit-summary, .hint-row { display: flex; flex-wrap: wrap; gap: 5px; min-width: 0; }
+    .submit-panel { display: grid; gap: 6px; min-width: 0; max-width: 100%; margin-bottom: 7px; padding: 7px; border: 1px solid var(--vscode-panel-border); border-radius: 7px; background: var(--vscode-editorWidget-background); }
+    .submit-summary, .hint-row { display: flex; flex-wrap: wrap; gap: 5px; min-width: 0; max-width: 100%; }
     .submit-summary.muted { margin-bottom: 8px; color: var(--vscode-descriptionForeground); }
-    .card-main { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 6px; }
+    .card-main { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 6px; min-width: 0; max-width: 100%; }
     .card-title { color: var(--vscode-foreground); font-size: 13px; font-weight: 650; line-height: 1.45; overflow-wrap: anywhere; }
-    .meta-grid { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.38; }
+    .meta-grid { display: flex; flex-wrap: wrap; gap: 5px; min-width: 0; max-width: 100%; margin-top: 5px; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.38; }
     .meta-chip, .link-chip { display: inline-flex; align-items: center; gap: 3px; max-width: 100%; min-width: 0; min-height: 21px; border: 1px solid var(--vscode-panel-border); border-radius: 999px; padding: 2px 6px; background: color-mix(in srgb, var(--vscode-editorWidget-background) 78%, transparent); color: var(--vscode-descriptionForeground); overflow-wrap: anywhere; }
     .meta-chip.wide { border-radius: 6px; }
     .meta-chip span:last-child, .link-chip { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
@@ -3964,7 +4247,7 @@ function baseHtml(body, options = {}) {
     .attr-chip.attr-lang { color: var(--vscode-button-background); border-color: color-mix(in srgb, var(--vscode-button-background) 42%, var(--vscode-panel-border)); }
     .attr-chip.attr-time { color: var(--vscode-editorWarning-foreground, #d29922); border-color: color-mix(in srgb, var(--vscode-editorWarning-foreground, #d29922) 32%, var(--vscode-panel-border)); }
     .attr-chip.attr-user { color: var(--vscode-foreground); border-color: color-mix(in srgb, var(--vscode-foreground) 24%, var(--vscode-panel-border)); }
-    .metric-row { display: flex; flex-wrap: wrap; gap: 5px; color: var(--vscode-descriptionForeground); font-size: 11px; }
+    .metric-row { display: flex; flex-wrap: wrap; gap: 5px; min-width: 0; max-width: 100%; color: var(--vscode-descriptionForeground); font-size: 11px; }
     .metric-chip { border: 1px solid var(--vscode-panel-border); border-radius: 6px; padding: 3px 6px; background: color-mix(in srgb, var(--vscode-editorWidget-background) 76%, transparent); font-weight: 600; }
     .metric-chip.ok { color: var(--vscode-testing-iconPassed, #2ea043); border-color: color-mix(in srgb, var(--vscode-testing-iconPassed, #2ea043) 42%, var(--vscode-panel-border)); background: color-mix(in srgb, var(--vscode-testing-iconPassed, #2ea043) 12%, transparent); }
     .metric-chip.bad { color: var(--vscode-errorForeground, #f85149); border-color: color-mix(in srgb, var(--vscode-errorForeground, #f85149) 40%, var(--vscode-panel-border)); background: color-mix(in srgb, var(--vscode-errorForeground, #f85149) 10%, transparent); }
@@ -3981,16 +4264,18 @@ function baseHtml(body, options = {}) {
     .status-badge.muted { color: var(--vscode-descriptionForeground); background: var(--vscode-editorWidget-background); }
     .history-card .status-badge.ok { box-shadow: inset 3px 0 0 var(--vscode-testing-iconPassed, #2ea043); }
     .history-card .status-badge.bad { box-shadow: inset 3px 0 0 var(--vscode-errorForeground, #f85149); }
-    .action-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(72px, 1fr)); gap: 5px; }
+    .action-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(72px, 100%), 1fr)); gap: 5px; min-width: 0; max-width: 100%; }
     .action-tile { display: inline-flex; justify-content: center; align-items: center; gap: 4px; min-height: 30px; text-align: center; background: var(--vscode-editorWidget-background); color: var(--vscode-foreground); border-color: var(--vscode-panel-border); }
     .action-tile .tile-icon { width: 14px; height: 14px; border-radius: 0; background: transparent; opacity: .76; }
     .action-tile.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
     .action-tile small { color: var(--vscode-descriptionForeground); }
     .action-tile.primary small { color: var(--vscode-button-foreground); opacity: .78; }
-    .setting-group { border: 1px solid var(--vscode-panel-border); border-radius: 7px; padding: 7px; margin: 0 0 8px; background: color-mix(in srgb, var(--vscode-editorWidget-background) 58%, transparent); }
+    .setting-group { min-width: 0; max-width: 100%; border: 1px solid var(--vscode-panel-border); border-radius: 7px; padding: 7px; margin: 0 0 8px; background: color-mix(in srgb, var(--vscode-editorWidget-background) 58%, transparent); }
     .setting-group legend { color: var(--vscode-foreground); font-size: 13px; font-weight: 650; padding: 0 6px; }
-    .example-box { display: grid; gap: 3px; margin: 8px 0; padding: 7px 8px; border: 1px dashed var(--vscode-panel-border); border-radius: 7px; background: var(--vscode-editorWidget-background); }
+    .example-box { display: grid; gap: 3px; min-width: 0; max-width: 100%; margin: 8px 0; padding: 7px 8px; border: 1px dashed var(--vscode-panel-border); border-radius: 7px; background: var(--vscode-editorWidget-background); }
     .example-box strong { color: var(--vscode-foreground); font-size: 12px; }
+    .template-builder { display: grid; gap: 7px; min-width: 0; max-width: 100%; margin-bottom: 9px; padding: 7px; border: 1px solid var(--vscode-panel-border); border-radius: 7px; background: var(--vscode-editorWidget-background); }
+    .template-builder textarea { min-height: 150px; }
     .item .meta { line-height: 1.45; overflow-wrap: anywhere; }
     .app textarea { min-height: 76px; }
     .app #templateAreas textarea { min-height: 260px; }
@@ -4026,6 +4311,7 @@ async function saveSettingsFromWebview(payload, context, client) {
   await cfg.update("rustLanguage", settings.rustLanguage, target);
   await cfg.update("javascriptLanguage", settings.javascriptLanguage, target);
   await cfg.update("typescriptLanguage", settings.typescriptLanguage, target);
+  await cfg.update("importBrowser", settings.importBrowser, target);
   await cfg.update("pollIntervalMs", settings.pollIntervalMs, target);
   await cfg.update("problemFolderName", settings.problemFolderName, target);
   await cfg.update("contestFolderName", settings.contestFolderName, target);
@@ -4036,6 +4322,7 @@ async function saveSettingsFromWebview(payload, context, client) {
   await cfg.update("openCreatedFile", settings.openCreatedFile, target);
   await cfg.update("fileNames", settings.fileNames, target);
   await cfg.update("templates", settings.templates, target);
+  await cfg.update("deletedTemplates", settings.deletedTemplates, target);
   await saveInterfacePosition(settings.interfacePosition, context, client);
 }
 
@@ -4071,16 +4358,26 @@ async function applyInterfacePosition(position) {
 }
 
 async function focusNowcoderApp(position) {
-  const viewId = normalizeInterfacePosition(position) === "right" ? "nowcoderRight.app" : "nowcoder.app";
-  try {
-    await vscode.commands.executeCommand(`${viewId}.focus`);
-    return true;
-  } catch {}
-  try {
-    await vscode.commands.executeCommand("workbench.action.openView", viewId);
-    return true;
-  } catch {}
+  const normalized = normalizeInterfacePosition(position);
+  const viewId = normalized === "right" ? "nowcoderRight.app" : "nowcoder.app";
+  const partCommand = normalized === "right" ? "workbench.action.focusAuxiliaryBar" : "workbench.action.focusSideBar";
+  await vscode.commands.executeCommand(partCommand).catch(() => {});
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await vscode.commands.executeCommand(`${viewId}.focus`);
+      return true;
+    } catch {}
+    try {
+      await vscode.commands.executeCommand("workbench.action.openView", viewId);
+      return true;
+    } catch {}
+    await delay(120);
+  }
   return false;
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function config() {
@@ -4105,6 +4402,7 @@ function defaultSettings() {
     rustLanguage: normalizeLanguageVersion("rust", cfg.get("rustLanguage", "rust")),
     javascriptLanguage: normalizeLanguageVersion("javascript", cfg.get("javascriptLanguage", "javascript_v8")),
     typescriptLanguage: normalizeLanguageVersion("typescript", cfg.get("typescriptLanguage", "typescript")),
+    importBrowser: normalizeImportBrowser(cfg.get("importBrowser", DEFAULT_IMPORT_BROWSER)),
     pollIntervalMs: cfg.get("pollIntervalMs", 1000),
     problemFolderName: cfg.get("problemFolderName", "{index}_{title}"),
     contestFolderName: cfg.get("contestFolderName", "{name}（{contestId}）"),
@@ -4115,7 +4413,8 @@ function defaultSettings() {
     openCreatedFile: cfg.get("openCreatedFile", true),
     interfacePosition: cfg.get("interfacePosition", "left"),
     fileNames: cfg.get("fileNames", DEFAULT_CODE_FILES),
-    templates: mergeDefaultTemplates(cfg.get("templates", {}))
+    templates: mergeDefaultTemplates(cfg.get("templates", {}), cfg.get("deletedTemplates", DEFAULT_DELETED_TEMPLATES)),
+    deletedTemplates: normalizeDeletedTemplates(cfg.get("deletedTemplates", DEFAULT_DELETED_TEMPLATES))
   };
 }
 
@@ -4132,6 +4431,7 @@ function normalizeSettings(payload) {
     rustLanguage: normalizeLanguageVersion("rust", payload.rustLanguage || defaults.rustLanguage || "rust"),
     javascriptLanguage: normalizeLanguageVersion("javascript", payload.javascriptLanguage || defaults.javascriptLanguage || "javascript_v8"),
     typescriptLanguage: normalizeLanguageVersion("typescript", payload.typescriptLanguage || defaults.typescriptLanguage || "typescript"),
+    importBrowser: normalizeImportBrowser(payload.importBrowser || defaults.importBrowser || DEFAULT_IMPORT_BROWSER),
     pollIntervalMs: Number(payload.pollIntervalMs) || defaults.pollIntervalMs || 1000,
     problemFolderName: payload.problemFolderName || defaults.problemFolderName || "{index}_{title}",
     contestFolderName: payload.contestFolderName || defaults.contestFolderName || "{name}（{contestId}）",
@@ -4140,13 +4440,51 @@ function normalizeSettings(payload) {
     publicContestCategories: Array.isArray(payload.publicContestCategories) && payload.publicContestCategories.length ? payload.publicContestCategories : defaults.publicContestCategories,
     createStatementMarkdown: payload.createStatementMarkdown !== undefined ? !!payload.createStatementMarkdown : defaults.createStatementMarkdown,
     openCreatedFile: payload.openCreatedFile !== undefined ? !!payload.openCreatedFile : defaults.openCreatedFile,
-    fileNames: ensureCoreCodeFiles(normalizeFileNames(payload.fileNames).length ? normalizeFileNames(payload.fileNames) : normalizeFileNames(defaults.fileNames)),
-    templates: mergeDefaultTemplates(payload.templates || defaults.templates || {})
+    fileNames: normalizeGeneratedFileNames(
+      normalizeFileNames(payload.fileNames).length ? normalizeFileNames(payload.fileNames) : normalizeFileNames(defaults.fileNames),
+      payload.templates || defaults.templates || {},
+      payload.deletedTemplates || defaults.deletedTemplates || []
+    ),
+    templates: mergeDefaultTemplates(payload.templates || defaults.templates || {}, payload.deletedTemplates || defaults.deletedTemplates || []),
+    deletedTemplates: normalizeDeletedTemplates(payload.deletedTemplates || defaults.deletedTemplates || [])
   };
 }
 
-function mergeDefaultTemplates(templates) {
-  return { ...DEFAULT_TEMPLATES, ...(templates || {}) };
+function normalizeGeneratedFileNames(fileNames, templates = {}, deletedTemplates = []) {
+  const deleted = new Set(normalizeDeletedTemplates(deletedTemplates).map(name => name.toLowerCase()));
+  const seen = new Set();
+  const files = [];
+  for (const file of [...DEFAULT_CODE_FILES, ...Object.keys(templates || {}), ...normalizeFileNames(fileNames)]) {
+    const name = normalizeTemplateFileName(file);
+    const key = name.toLowerCase();
+    if (!name || seen.has(key) || deleted.has(key)) continue;
+    seen.add(key);
+    files.push(name);
+  }
+  return ensureCoreCodeFiles(files);
+}
+
+function mergeDefaultTemplates(templates, deletedTemplates = []) {
+  const deleted = new Set(normalizeDeletedTemplates(deletedTemplates).map(name => name.toLowerCase()));
+  const merged = { ...DEFAULT_TEMPLATES, ...(templates || {}) };
+  for (const name of Object.keys(merged)) {
+    if (deleted.has(name.toLowerCase())) delete merged[name];
+  }
+  return merged;
+}
+
+function normalizeDeletedTemplates(value) {
+  const list = Array.isArray(value) ? value : [value];
+  const seen = new Set();
+  const names = [];
+  for (const item of list) {
+    const name = normalizeTemplateFileName(item);
+    const key = name.toLowerCase();
+    if (!name || seen.has(key)) continue;
+    seen.add(key);
+    names.push(name);
+  }
+  return names;
 }
 
 function normalizeLanguageVersion(group, value) {
@@ -4164,6 +4502,27 @@ function normalizeInterfacePosition(value) {
   return String(value || "").toLowerCase() === "right" ? "right" : "left";
 }
 
+function importBrowserChoices() {
+  return [
+    { value: IMPORT_BROWSER_AUTO, label: "自动" },
+    ...MAC_CHROMIUM_BROWSERS.map(item => ({ value: item.id, label: item.browser }))
+  ];
+}
+
+function normalizeImportBrowser(value) {
+  const key = String(value || DEFAULT_IMPORT_BROWSER).trim().toLowerCase();
+  if (!key || key === "default") return DEFAULT_IMPORT_BROWSER;
+  if (key === IMPORT_BROWSER_AUTO) return IMPORT_BROWSER_AUTO;
+  const matched = MAC_CHROMIUM_BROWSERS.find(item => [item.id, item.browser].some(alias => String(alias || "").toLowerCase() === key));
+  return matched ? matched.id : DEFAULT_IMPORT_BROWSER;
+}
+
+function importBrowserLabel(value) {
+  const selected = normalizeImportBrowser(value);
+  const matched = importBrowserChoices().find(item => item.value === selected);
+  return matched ? matched.label : "自动";
+}
+
 function normalizePythonLanguage(value) {
   const key = String(value || "python3").trim().toLowerCase();
   if (key === "pypy") return "pypy3";
@@ -4177,6 +4536,15 @@ function normalizeFileNames(value) {
     .flatMap(item => String(item || "").replace(/\\n/g, "\n").split(/\r?\n/))
     .map(item => item.trim())
     .filter(Boolean);
+}
+
+function normalizeTemplateFileName(value) {
+  return String(value || "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .map(part => part.trim())
+    .filter(Boolean)
+    .join("/");
 }
 
 function ensureCoreCodeFiles(value) {
@@ -4568,20 +4936,21 @@ function officialSubmitLanguageName(lang, langId) {
 }
 
 const MAC_CHROMIUM_BROWSERS = [
-  { browser: "Google Chrome", supportPath: ["Google", "Chrome"], safeStorage: "Chrome Safe Storage" },
-  { browser: "Microsoft Edge", supportPath: ["Microsoft Edge"], safeStorage: "Microsoft Edge Safe Storage" },
-  { browser: "Brave", supportPath: ["BraveSoftware", "Brave-Browser"], safeStorage: "Brave Safe Storage" },
-  { browser: "Chromium", supportPath: ["Chromium"], safeStorage: "Chromium Safe Storage" },
-  { browser: "Arc", supportPath: ["Arc", "User Data"], safeStorage: "Arc Safe Storage" }
+  { id: "chrome", browser: "Google Chrome", supportPath: ["Google", "Chrome"], safeStorage: "Chrome Safe Storage" },
+  { id: "edge", browser: "Microsoft Edge", supportPath: ["Microsoft Edge"], safeStorage: "Microsoft Edge Safe Storage" },
+  { id: "brave", browser: "Brave", supportPath: ["BraveSoftware", "Brave-Browser"], safeStorage: "Brave Safe Storage" },
+  { id: "chromium", browser: "Chromium", supportPath: ["Chromium"], safeStorage: "Chromium Safe Storage" },
+  { id: "arc", browser: "Arc", supportPath: ["Arc", "User Data"], safeStorage: "Arc Safe Storage" }
 ];
 
-async function importNowcoderCookieFromBrowsers() {
+async function importNowcoderCookieFromBrowsers(browserPreference = DEFAULT_IMPORT_BROWSER) {
   if (process.platform !== "darwin") {
     throw new Error("当前自动浏览器导入只支持 macOS。");
   }
-  const profiles = await findMacChromiumCookieProfiles();
+  const selected = normalizeImportBrowser(browserPreference);
+  const profiles = await findMacChromiumCookieProfiles(selected);
   if (!profiles.length) {
-    throw new Error("没有找到 Chrome/Edge/Brave/Chromium/Arc 的 Cookie 数据库。");
+    throw new Error(selected === IMPORT_BROWSER_AUTO ? "没有找到 Chrome/Edge/Brave/Chromium/Arc 的 Cookie 数据库。" : `没有找到 ${importBrowserLabel(selected)} 的 Cookie 数据库。`);
   }
 
   const errors = [];
@@ -4616,13 +4985,16 @@ async function importNowcoderCookieFromBrowsers() {
   }
 
   const suffix = errors.length ? `\n${errors.slice(0, 5).join("\n")}` : "";
-  throw new Error(`没有从浏览器里找到有效的牛客登录态。请先在浏览器登录牛客后再试。${suffix}`);
+  const target = selected === IMPORT_BROWSER_AUTO ? "浏览器" : importBrowserLabel(selected);
+  throw new Error(`没有从${target}里找到有效的牛客登录态。请先在${target}登录牛客后再试。${suffix}`);
 }
 
-async function findMacChromiumCookieProfiles() {
+async function findMacChromiumCookieProfiles(browserPreference = DEFAULT_IMPORT_BROWSER) {
   const result = [];
   const appSupport = path.join(os.homedir(), "Library", "Application Support");
-  for (const def of MAC_CHROMIUM_BROWSERS) {
+  const selected = normalizeImportBrowser(browserPreference);
+  const browserDefs = selected === IMPORT_BROWSER_AUTO ? MAC_CHROMIUM_BROWSERS : MAC_CHROMIUM_BROWSERS.filter(item => item.id === selected);
+  for (const def of browserDefs) {
     const base = path.join(appSupport, ...def.supportPath);
     if (!await exists(base)) continue;
     const candidates = [base];
@@ -5743,6 +6115,11 @@ function languageOptions(current) {
 function languageVersionOptions(group, current) {
   const selected = normalizeLanguageVersion(group, current);
   return (LANGUAGE_VERSION_OPTIONS[group] || []).map(item => `<option value="${item.value}" ${item.value === selected ? "selected" : ""}>${escapeHtml(item.label)}</option>`).join("");
+}
+
+function importBrowserOptions(current) {
+  const selected = normalizeImportBrowser(current);
+  return importBrowserChoices().map(item => `<option value="${escapeHtml(item.value)}" ${item.value === selected ? "selected" : ""}>${escapeHtml(item.label)}</option>`).join("");
 }
 
 function formatDateShort(value) {

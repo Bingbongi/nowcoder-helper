@@ -16,11 +16,23 @@
 
 在 VSCode 打开本目录，按 `F5` 启动 Extension Host。
 
+## 本地打包安装
+
+常用开发命令：
+
+```bash
+npm run check
+npm run package:local
+npm run install:local
+```
+
+也可以直接运行 `npm run reinstall:local`，它会重新打包并安装当前目录生成的 VSIX。安装完成后，在 VSCode 执行 `Developer: Reload Window` 使新版本生效。
+
 ## 登录
 
 打开“牛客”主页，在登录区填写牛客账号和密码，插件会自动向牛客登录接口换取 Cookie 并保存到 VSCode Secret Storage。
 
-如果牛客触发验证码或风控，插件无法绕过验证码。你可以先在 Chrome/Edge/Brave/Chromium/Arc 里正常登录牛客，然后回到插件点“从浏览器导入”，插件只读取 `nowcoder.com` 的 Cookie。登录区的 `Cookie / Token` 折叠项保留为高级备用入口：
+如果牛客触发验证码或风控，插件无法绕过验证码。你可以先在 Chrome/Edge/Brave/Chromium/Arc 里正常登录牛客，然后回到插件点“从浏览器导入”，并在登录区或设置里选择要读取的浏览器；插件只读取 `nowcoder.com` 的 Cookie。登录区的 `Cookie / Token` 折叠项保留为高级备用入口：
 
 - `QuestionBank Token`：用于题库接口、题面和非比赛题提交判题。
 - `Nowcoder Cookie`：用于比赛登录态、报名、比赛题目映射、排行榜、比赛提交和比赛提交记录。
@@ -43,8 +55,8 @@ Cookie、QuestionBank Token 和账号信息会保存到 VSCode Secret Storage，
 
 ## 设置与记录
 
-设置集中在“牛客”主页中维护，不再维护单独的重复设置页面。多个代码文件名请在“代码文件名”里逐行填写；旧版本保存成字面量 `\n` 的配置会自动兼容。
+设置集中在“牛客”主页中维护，不再维护单独的重复设置页面。代码文件由模板区统一维护：选择语言、确认代码文件名、填写模板内容后点“添加/更新模板”，插件会把该文件加入创建目录时的生成列表。删除非核心模板时，也会停止生成对应代码文件；核心默认文件 `main.cpp`、`main.c`、`Main.java`、`main.py` 会保留以兼容旧流程。旧版本保存成字面量 `\n` 的配置会自动兼容。
 
 “提交”页可以搜索并选择比赛，拉取当前账号在该比赛的提交记录，查看结果、运行时间、运行空间、判题状态和单次提交代码。打开比赛目录下的代码文件提交时，插件会使用 Cookie 走牛客正式比赛提交入口 `/nccommon/submit_cd`，并通过 `/nccommon/status` 查询正式提交记录；非比赛题仍保留 QuestionBank Token 提交流程。
 
-创建比赛题目目录时，新建的 `main.cpp`、`main.c`、`Main.java`、`main.py` 会在文件头写入比赛名、题目名、时间限制、空间限制和作者；已有代码文件只同步文件头，不覆盖正文。代码模板会自动补齐核心文件模板，包括 `main.c`。提交设置里的语言选项按牛客当前下拉同步，例如 C++（clang++18）、C++(g++ 13)、C(gcc 10)、Python3、pypy3、JavaScript V8、JavaScript Node 等；普通 `.py` 文件名包含 `pypy3` 或 `pypy` 时会自动按 PyPy3 提交。
+创建比赛题目目录时，新建的 `main.cpp`、`main.c`、`Main.java`、`main.py` 会在文件头写入比赛名、题目名、时间限制、空间限制和作者；作者设置留空时会优先使用当前登录的牛客用户名，手动填写时优先使用填写值。已有代码文件只同步文件头，不覆盖正文。代码模板会自动补齐核心文件模板，包括 `main.c`。提交设置里的语言选项按牛客当前下拉同步，例如 C++（clang++18）、C++(g++ 13)、C(gcc 10)、Python3、pypy3、JavaScript V8、JavaScript Node 等；普通 `.py` 文件名包含 `pypy3` 或 `pypy` 时会自动按 PyPy3 提交。

@@ -24,6 +24,8 @@
     "onCommand:nowcoder.importBrowserCookie",
     "onCommand:nowcoder.logout",
     "onCommand:nowcoder.authCheck",
+    "onCommand:nowcoder.viewProblem",
+    "onCommand:nowcoder.createProblem",
     "onCommand:nowcoder.submitCurrentFile",
     "onCommand:nowcoder.fetchContests",
     "onCommand:nowcoder.signupContest",
@@ -132,6 +134,18 @@
         "title": "检查登录状态",
         "category": "牛客",
         "icon": "$(shield)"
+      },
+      {
+        "command": "nowcoder.viewProblem",
+        "title": "查看题目 Markdown",
+        "category": "牛客",
+        "icon": "$(preview)"
+      },
+      {
+        "command": "nowcoder.createProblem",
+        "title": "创建题目目录",
+        "category": "牛客",
+        "icon": "$(new-folder)"
       },
       {
         "command": "nowcoder.submitCurrentFile",
@@ -396,6 +410,41 @@
           "maximum": 10000,
           "description": "提交后轮询判题结果的间隔。"
         },
+        "nowcoder.requestTimeoutMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 1000,
+          "maximum": 120000,
+          "description": "请求牛客接口的单次超时时间，单位毫秒。"
+        },
+        "nowcoder.requestRetries": {
+          "type": "number",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 5,
+          "description": "网络超时或临时失败时的请求尝试次数。"
+        },
+        "nowcoder.maxRankPages": {
+          "type": "number",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 200,
+          "description": "拉取排行榜时最多请求的分页数量。"
+        },
+        "nowcoder.maxSubmissionPages": {
+          "type": "number",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 500,
+          "description": "拉取比赛提交记录时最多请求的分页数量。"
+        },
+        "nowcoder.prepareConcurrency": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "创建比赛目录时并发处理题目的数量。"
+        },
         "nowcoder.publicContestCategories": {
           "type": "array",
           "default": [
@@ -438,10 +487,14 @@
     }
   },
   "scripts": {
-    "check": "node --check extension.js",
+    "check": "node --check extension.js && node --check scripts/package-local.js && node --check scripts/install-local.js && node --check tests/unit.test.js && npm test",
+    "test": "node tests/unit.test.js",
     "package:local": "node scripts/package-local.js",
     "install:local": "node scripts/install-local.js",
     "reinstall:local": "npm run package:local && npm run install:local"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@vscode/vsce": "^3.9.2"
+  }
 }

@@ -18,8 +18,6 @@ const JUDGE_SUBMIT_URL = "https://victorinox.nowcoder.com/api/service/judge/subm
 const JUDGE_STATUS_URL = "https://victorinox.nowcoder.com/api/service/judge/submit-status";
 const ACM_CONTEST_SUBMIT_URL = `${NOWCODER_ACM_BASE}/nccommon/submit_cd`;
 const ACM_CONTEST_STATUS_URL = `${NOWCODER_ACM_BASE}/nccommon/status`;
-const LOGIN_CONFIG_URL = `${NOWCODER_WWW_BASE}/nccommon/environment/config`;
-const PASSWORD_LOGIN_URL = `${NOWCODER_WWW_BASE}/nccommon/login-or-register/do`;
 const USER_INFO_URL = `${NOWCODER_WWW_BASE}/completeness/user-info`;
 
 const SECRET_TOKEN = "nowcoder.questionbankToken";
@@ -30,10 +28,16 @@ const PROBLEM_BINDINGS_KEY = "nowcoder.problemBindings";
 const AUTH_CACHE_KEY = "nowcoder.authCache";
 const AUTH_CACHE_TTL_MS = 5 * 60 * 1000;
 const ACCOUNT_SETTINGS_PREFIX = "nowcoder.accountSettings.";
+const ACCOUNT_HISTORY_PREFIX = "nowcoder.submissionHistory.";
 const DEFAULT_CODE_FILES = ["main.cpp", "main.c", "Main.java", "main.py"];
 const DEFAULT_DELETED_TEMPLATES = [];
 const IMPORT_BROWSER_AUTO = "auto";
 const DEFAULT_IMPORT_BROWSER = "chrome";
+const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
+const AUTH_CHECK_TIMEOUT_MS = 8000;
+const DEFAULT_MAX_RANK_PAGES = 20;
+const DEFAULT_MAX_SUBMISSION_PAGES = 20;
+const DEFAULT_PREPARE_CONCURRENCY = 4;
 const TEMPLATE_FILE_BY_LANGUAGE = {
   cpp: "main.cpp",
   c: "main.c",
@@ -264,6 +268,8 @@ function activate(context) {
   register(context, "nowcoder.importBrowserCookie", () => importBrowserCookieCommand(client));
   register(context, "nowcoder.logout", () => logoutCommand(client));
   register(context, "nowcoder.authCheck", () => authCheckCommand(client));
+  register(context, "nowcoder.viewProblem", item => viewProblemCommand(client, item));
+  register(context, "nowcoder.createProblem", item => createProblemCommand(context, client, item));
   register(context, "nowcoder.submitCurrentFile", () => submitCurrentFileCommand(context, client));
   register(context, "nowcoder.fetchContests", () => fetchContestsCommand(context, client));
   register(context, "nowcoder.signupContest", item => signupContestCommand(client, item));
@@ -401,9 +407,25 @@ class NowcoderClient {
   }
 
   async requestText(url, options = {}) {
+    const attempts = requestAttemptCount(options);
+    let lastError = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        return await this.requestTextOnce(url, options);
+      } catch (err) {
+        lastError = err;
+        if (attempt + 1 >= attempts || !isRetryableRequestError(err)) break;
+        await sleep(Math.min(5000, 400 * Math.pow(2, attempt)));
+      }
+    }
+    throw lastError;
+  }
+
+  async requestTextOnce(url, options = {}) {
     if (typeof fetch !== "function") {
       throw new Error("当前 VSCode 运行时不支持 fetch，请升级 VSCode 后重试。");
     }
+    const timeoutMs = options.timeoutMs || configuredPositiveInt("requestTimeoutMs", DEFAULT_REQUEST_TIMEOUT_MS, 1000, 120000);
     const headers = {
       Accept: options.accept || "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "User-Agent": "Mozilla/5.0 Nowcoder-Helper-VSCode",
@@ -431,11 +453,11 @@ class NowcoderClient {
 
     let resp;
     try {
-      resp = await fetch(url, {
+      resp = await fetchWithTimeout(url, {
         method: options.method || "GET",
         headers,
         body
-      });
+      }, timeoutMs);
     } catch (err) {
       if (options.nodeHttpFallback) {
         try {
@@ -444,7 +466,7 @@ class NowcoderClient {
             headers,
             body,
             family: options.family || 4,
-            timeoutMs: options.timeoutMs
+            timeoutMs
           });
         } catch (fallbackErr) {
           if (options.curlFallback) {
@@ -453,7 +475,7 @@ class NowcoderClient {
                 method: options.method || "GET",
                 headers,
                 body,
-                timeoutMs: options.timeoutMs
+                timeoutMs
               });
             } catch (curlErr) {
               throw new Error(`请求 ${safeUrlHost(url)} 失败：${errorDetails(err)}；Node HTTPS 兜底也失败：${errorDetails(fallbackErr)}；curl 兜底也失败：${errorDetails(curlErr)}`);
@@ -485,6 +507,7 @@ class NowcoderClient {
 
   async requestJsonWithCookieJar(url, options = {}) {
     const jar = options.cookieJar || new CookieJar();
+    const timeoutMs = options.timeoutMs || configuredPositiveInt("requestTimeoutMs", DEFAULT_REQUEST_TIMEOUT_MS, 1000, 120000);
     const headers = {
       Accept: "application/json, text/plain, */*",
       "User-Agent": "Mozilla/5.0 Nowcoder-Helper-VSCode",
@@ -501,11 +524,11 @@ class NowcoderClient {
       headers["Content-Type"] = "application/json";
     }
 
-    const resp = await fetch(url, {
+    const resp = await fetchWithTimeout(url, {
       method: options.method || "GET",
       headers,
       body
-    });
+    }, timeoutMs);
     jar.applyResponseHeaders(resp.headers);
     const text = await resp.text();
     if (!resp.ok) {
@@ -525,60 +548,6 @@ class NowcoderClient {
     return resp;
   }
 
-  async loginWithPassword({ account, password, remember = true, token = "" }) {
-    const loginAccount = String(account || "").trim();
-    if (!loginAccount) throw new Error("请输入牛客账号。");
-    if (!password) throw new Error("请输入牛客密码。");
-
-    const jar = new CookieJar(await this.getCookie());
-    const configResp = await this.requestJsonWithCookieJar(LOGIN_CONFIG_URL, {
-      cookieJar: jar,
-      headers: {
-        Origin: NOWCODER_WWW_BASE
-      },
-      referer: `${NOWCODER_WWW_BASE}/login`
-    });
-    this.ensureOk(configResp, "获取登录公钥失败");
-    const publicKey = configResp.data && configResp.data.rsaPublicKey;
-    if (!publicKey) throw new Error("获取登录公钥失败：接口没有返回 rsaPublicKey。");
-
-    const cipherPwd = encryptPassword(password, publicKey);
-    const loginResp = await this.requestJsonWithCookieJar(PASSWORD_LOGIN_URL, {
-      method: "POST",
-      cookieJar: jar,
-      jsonBody: {
-        account: loginAccount,
-        cipherPwd,
-        remember: !!remember,
-        source: 3
-      },
-      headers: {
-        Origin: NOWCODER_WWW_BASE
-      },
-      referer: `${NOWCODER_WWW_BASE}/login`
-    });
-
-    if (!loginResp || loginResp.code !== 0) {
-      if (loginResp && (loginResp.code === 1125 || loginResp.code === 499)) {
-        throw new Error(`${loginResp.msg || "登录需要验证码"}。牛客当前要求网页验证码/短信风控，请先在浏览器网页登录后点“从浏览器导入”。`);
-      }
-      throw new Error(`账号密码登录失败: ${jsonPreview(loginResp)}`);
-    }
-
-    const cookie = jar.toString();
-    if (!cookie) {
-      throw new Error("账号密码登录成功但没有拿到 Cookie，请改用手动 Cookie 登录。");
-    }
-    await this.saveCredentials({ token, cookie });
-    await this.saveAccountName(loginAccount);
-    return {
-      account: loginAccount,
-      cookie,
-      cookieMask: maskCookie(cookie),
-      response: loginResp
-    };
-  }
-
   async importCookieFromBrowser(browserPreference) {
     const previous = await this.getCookie();
     const browser = normalizeImportBrowser(browserPreference || config().get("importBrowser", DEFAULT_IMPORT_BROWSER));
@@ -593,13 +562,14 @@ class NowcoderClient {
     return result;
   }
 
-  async getCurrentUserInfo() {
+  async getCurrentUserInfo(options = {}) {
     const resp = await this.requestJson(USER_INFO_URL, {
       cookie: true,
       headers: {
         "X-Requested-With": "XMLHttpRequest"
       },
-      referer: NOWCODER_WWW_BASE
+      referer: NOWCODER_WWW_BASE,
+      timeoutMs: options.timeoutMs
     });
     this.ensureOk(resp, "获取当前用户信息失败");
     return normalizeUserInfo(resp.data || {});
@@ -641,7 +611,7 @@ class NowcoderClient {
 
     if (token) {
       try {
-        const accessToken = await this.getAccessToken(token);
+        const accessToken = await this.getAccessToken(token, { timeoutMs: AUTH_CHECK_TIMEOUT_MS });
         result.judgeAuth = !!accessToken;
         result.accessTokenMask = maskSecret(accessToken);
       } catch (err) {
@@ -652,14 +622,18 @@ class NowcoderClient {
     if (cookie) {
       result.cookieUserId = extractCookieValue(cookie, "NOWCODERUID") || "";
       try {
-        const html = await this.requestText(`${NOWCODER_ACM_BASE}/acm/contest/vip-index`, { cookie: true });
+        const html = await this.requestText(`${NOWCODER_ACM_BASE}/acm/contest/vip-index`, {
+          cookie: true,
+          timeoutMs: AUTH_CHECK_TIMEOUT_MS,
+          retries: 1
+        });
         result.acLogin = /window\.isLogin\s*=\s*true/.test(html) || !/nav-account-login/.test(html);
         mergeUserInfo(result, extractCurrentUserFromHtml(html));
       } catch (err) {
         result.acError = err.message;
       }
       try {
-        const user = await this.getCurrentUserInfo();
+        const user = await this.getCurrentUserInfo({ timeoutMs: AUTH_CHECK_TIMEOUT_MS });
         mergeUserInfo(result, user);
         if (user.userId || user.userName) result.acLogin = true;
       } catch (err) {
@@ -672,13 +646,15 @@ class NowcoderClient {
     return result;
   }
 
-  async getAccessToken(tokenArg) {
+  async getAccessToken(tokenArg, options = {}) {
     const token = tokenArg || await this.requireToken();
     const url = `${QUESTIONBANK_BASE}/qms/base-oauth/access-token?sceneId=0&sceneType=1001&_=${Date.now()}`;
     const resp = await this.requestJson(url, {
       headers: {
         Authorization: this.authHeader(token)
-      }
+      },
+      timeoutMs: options.timeoutMs,
+      retries: options.retries || 1
     });
     const accessToken = resp && resp.data && resp.data.accessToken;
     if (!accessToken) {
@@ -1057,9 +1033,10 @@ class NowcoderClient {
   }
 
   async fetchAllRank(contestId, limit = 100) {
+    const maxPages = configuredPositiveInt("maxRankPages", DEFAULT_MAX_RANK_PAGES, 1, 200);
     let merged = null;
     const seen = new Set();
-    for (let page = 1; page <= 100; page += 1) {
+    for (let page = 1; page <= maxPages; page += 1) {
       const current = await this.fetchRank(contestId, page, limit);
       const rows = current.rankData || [];
       if (!merged) merged = { ...current, rankData: [] };
@@ -1149,6 +1126,7 @@ class NowcoderClient {
   }
 
   async fetchContestSubmissionsByScope(contestId, contest, scope, pageSize = 50) {
+    const maxPages = configuredPositiveInt("maxSubmissionPages", DEFAULT_MAX_SUBMISSION_PAGES, 1, 500);
     const rows = [];
     const seen = new Set();
     let merged = null;
@@ -1174,14 +1152,14 @@ class NowcoderClient {
     const pageCount = explicitPageCount(first.basicInfo || first);
     if (pageCount > 1) {
       const pages = [];
-      for (let page = 2; page <= Math.min(pageCount, 500); page += 1) pages.push(page);
+      for (let page = 2; page <= Math.min(pageCount, maxPages); page += 1) pages.push(page);
       const rest = await mapLimit(pages, 8, page => this.fetchContestSubmissionPage(contestId, page, pageSize, scope).catch(err => {
         output.appendLine(`拉取提交记录分页失败 contest=${contestId} scope=${scope} page=${page}: ${err.message}`);
         return null;
       }));
       rest.forEach(addPage);
     } else if (!pageCount && firstRows.length >= pageSize) {
-      for (let page = 2; page <= 500; page += 1) {
+      for (let page = 2; page <= maxPages; page += 1) {
         const current = await this.fetchContestSubmissionPage(contestId, page, pageSize, scope);
         const currentRows = firstArray(current.data, current.rows, current.list, current.records, current.statusList, current);
         const added = addPage(current);
@@ -1653,7 +1631,6 @@ class ContestTreeProvider {
 
 class SubmissionTreeProvider {
   constructor(context) {
-    this.context = context;
     this._onDidChangeTreeData = new vscode.EventEmitter();
     this.onDidChangeTreeData = this._onDidChangeTreeData.event;
   }
@@ -1725,7 +1702,10 @@ class NowcoderAppProvider {
 
   resolveWebviewView(view) {
     this.view = view;
-    view.webview.options = { enableScripts: true };
+    view.webview.options = {
+      enableScripts: true,
+      localResourceRoots: []
+    };
     view.webview.html = renderNowcoderAppHtml(view.webview);
     view.webview.onDidReceiveMessage(message => this.handleMessage(message));
     this.postActiveFile();
@@ -1735,9 +1715,6 @@ class NowcoderAppProvider {
     try {
       if (message.type === "ready") {
         await this.postState();
-      } else if (message.type === "loginPassword") {
-        await this.withBusy("正在登录...", () => this.client.loginWithPassword(message.payload || {}));
-        await this.postState("账号密码登录成功", { forceAuthRefresh: true });
       } else if (message.type === "importBrowserCookie") {
         const result = await this.withBusy("正在从浏览器导入登录态...", () => this.client.importCookieFromBrowser(message.browser));
         await this.postState(`已从 ${result.browser} 导入登录态`, { forceAuthRefresh: true });
@@ -1746,9 +1723,10 @@ class NowcoderAppProvider {
           token: message.payload && message.payload.token,
           cookie: message.payload && message.payload.cookie
         }));
-        await this.client.saveAccountName(message.payload && message.payload.account);
         await this.postState("登录信息已保存", { forceAuthRefresh: true });
       } else if (message.type === "logout") {
+        const confirmed = await confirmLogout();
+        if (!confirmed) return;
         await this.client.clearCredentials();
         await this.postState("已退出", { forceAuthRefresh: true });
       } else if (message.type === "saveSettings") {
@@ -1956,7 +1934,7 @@ class NowcoderAppProvider {
     if (submissionProvider) submissionProvider.refresh();
     output.appendLine(`提交记录 contest=${id} scope=${result.scope || ""} ownerId=${submissionOwnerId(owner) || submissionBasicUid(result) || ""} rows=${this.submissionRows.length}`);
     await this.postState(result.scope === "unknown-owner"
-      ? "未识别当前用户 ID，无法只看自己的提交。请重新登录或从浏览器导入 Cookie。"
+      ? "未识别当前用户 ID，无法只看自己的提交。请在浏览器登录牛客后从浏览器导入 Cookie。"
       : `已拉取 ${this.submissionRows.length} 条自己的提交记录`);
     contestInfoPromise.then(async updated => {
       if (!updated || String(this.submissionContestId || "") !== id) return;
@@ -2027,7 +2005,7 @@ class NowcoderAppProvider {
   async postState(toast, options = {}) {
     const settings = await loadAccountSettings(this.context, this.client);
     const auth = await this.getFastAuthState();
-    this.postStatePayload(auth, settings, toast);
+    await this.postStatePayload(auth, settings, toast);
     if (options.forceAuthRefresh || shouldRefreshAuth(auth)) {
       this.refreshAuthState(settings, toast);
     }
@@ -2045,12 +2023,20 @@ class NowcoderAppProvider {
     }));
   }
 
-  postStatePayload(auth, settings, toast) {
+  async submissionHistory() {
+    const key = await accountHistoryKey(this.client).catch(() => HISTORY_KEY);
+    const accountHistory = this.context.globalState.get(key, []);
+    if (accountHistory.length) return accountHistory;
+    return this.context.globalState.get(HISTORY_KEY, []);
+  }
+
+  async postStatePayload(auth, settings, toast) {
+    const history = await this.submissionHistory();
     this.post({
       type: "state",
       auth,
       settings,
-      history: this.context.globalState.get(HISTORY_KEY, []).slice(0, 100),
+      history: history.slice(0, 100),
       contests: this.contests,
       submissionContestId: this.submissionContestId,
       submissionContestName: this.submissionContestName,
@@ -2061,16 +2047,32 @@ class NowcoderAppProvider {
   }
 
   refreshAuthState(settings, toast) {
+    this.post({
+      type: "authRefresh",
+      checking: true,
+      message: "正在检查登录状态..."
+    });
     this.client.checkAuth().then(auth => {
-      this.postStatePayload(auth, settings, toast);
+      this.post({
+        type: "authRefresh",
+        checking: false,
+        message: authStatusMessage(auth)
+      });
+      this.postStatePayload(auth, settings, toast).catch(err => output.appendLine(`刷新登录状态后推送状态失败：${err.message}`));
     }).catch(err => {
+      this.post({
+        type: "authRefresh",
+        checking: false,
+        message: `登录检查失败：${err.message}`,
+        kind: "warning"
+      });
       this.postStatePayload({
         tokenConfigured: false,
         cookieConfigured: false,
         judgeAuth: false,
         acLogin: false,
         error: err.message
-      }, settings, toast);
+      }, settings, toast).catch(postErr => output.appendLine(`推送登录失败状态失败：${postErr.message}`));
     }).finally(() => {
       this.postActiveFile();
     });
@@ -2103,7 +2105,6 @@ class NowcoderAppProvider {
 
 async function loginCommand(client) {
   const choices = [
-    { label: "账号密码登录", mode: "password" },
     { label: "粘贴 Cookie + QuestionBank Token", mode: "both" },
     { label: "仅粘贴 Cookie", mode: "cookie" },
     { label: "仅粘贴 QuestionBank Token", mode: "token" },
@@ -2114,33 +2115,6 @@ async function loginCommand(client) {
 
   if (pick.mode === "browser") {
     await vscode.env.openExternal(vscode.Uri.parse(`${NOWCODER_ACM_BASE}/login?callBack=/`));
-    return;
-  }
-
-  if (pick.mode === "password") {
-    const account = await vscode.window.showInputBox({
-      title: "牛客账号",
-      prompt: "输入牛客邮箱或手机号",
-      ignoreFocusOut: true
-    });
-    if (account === undefined) return;
-    const password = await vscode.window.showInputBox({
-      title: "牛客密码",
-      password: true,
-      ignoreFocusOut: true
-    });
-    if (password === undefined) return;
-    try {
-      await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: "牛客账号密码登录" },
-        () => client.loginWithPassword({ account, password, remember: true })
-      );
-      const result = await client.checkAuth();
-      vscode.window.showInformationMessage(`牛客登录成功。比赛登录: ${result.acLogin ? "OK" : "未验证"}，判题: ${result.judgeAuth ? "OK" : "未配置"}`);
-    } catch (err) {
-      const action = await vscode.window.showErrorMessage(`账号密码登录失败：${err.message}`, "打开网页登录");
-      if (action === "打开网页登录") await vscode.env.openExternal(vscode.Uri.parse(`${NOWCODER_ACM_BASE}/login?callBack=/`));
-    }
     return;
   }
 
@@ -2177,8 +2151,19 @@ async function loginCommand(client) {
 }
 
 async function logoutCommand(client) {
+  const confirmed = await confirmLogout();
+  if (!confirmed) return;
   await client.clearCredentials();
   vscode.window.showInformationMessage("已清除牛客登录信息。");
+}
+
+async function confirmLogout() {
+  const action = await vscode.window.showWarningMessage(
+    "确定要退出牛客登录吗？插件会清除已保存的 Cookie、Token 和账号名。",
+    { modal: true },
+    "退出登录"
+  );
+  return action === "退出登录";
 }
 
 async function importBrowserCookieCommand(client) {
@@ -2354,7 +2339,7 @@ async function submitCurrentFileCommand(context, client, options = {}) {
       problemId: result.problemId || meta.problemId,
       createdAt: new Date().toISOString()
     };
-    await pushSubmissionHistory(context, historyRow);
+    await pushSubmissionHistory(context, historyRow, client);
     if (submissionProvider) submissionProvider.refresh();
     reportSubmit({
       ...historyRow,
@@ -2517,16 +2502,18 @@ async function prepareContestCommand(context, client, item) {
       async progress => {
         const problems = await client.getContestProblemMappings(contest.contestId, progress);
         const rows = [];
-        for (const problem of problems) {
+        const concurrency = configuredPositiveInt("prepareConcurrency", DEFAULT_PREPARE_CONCURRENCY, 1, 10);
+        const preparedRows = await mapLimit(problems, concurrency, async problem => {
           const created = await prepareProblemFolder(context, client, normalizeProblemLike({ ...problem, contestName }), contestDir, { open: false, tolerateStatementError: true, authorName });
-          rows.push({ ...problem, ...created });
-        }
+          return { ...problem, ...created };
+        });
+        rows.push(...preparedRows);
         return rows;
       }
     );
     const okCount = prepared.filter(item => item.dir).length;
     const firstCreated = prepared.find(item => Array.isArray(item.files) && item.files.length);
-    if (firstCreated) {
+    if (config().get("openCreatedFile", true) && firstCreated) {
       const doc = await vscode.workspace.openTextDocument(firstCreated.files[0]);
       await vscode.window.showTextDocument(doc, { preview: false });
     }
@@ -2655,7 +2642,7 @@ async function prepareProblemFolder(context, client, problem, baseDir, options =
     await writeFileIfAbsent(statementPath, body);
   }
 
-  const fileNames = ensureCoreCodeFiles(cfg.get("fileNames", DEFAULT_CODE_FILES));
+  const fileNames = codeFilesFromConfig(cfg);
   const templates = mergeDefaultTemplates(cfg.get("templates", {}), cfg.get("deletedTemplates", DEFAULT_DELETED_TEMPLATES));
   const createdFiles = [];
   for (const fileName of fileNames) {
@@ -2731,6 +2718,10 @@ function authorNameFromAuth(auth) {
     auth && auth.name,
     auth && auth.account
   ));
+}
+
+function codeFilesFromConfig(cfg = config()) {
+  return normalizeGeneratedFileNames(cfg.get("fileNames", DEFAULT_CODE_FILES));
 }
 
 function formatQuestionMarkdown(question) {
@@ -3039,7 +3030,7 @@ function renderNowcoderAppHtml(webview) {
           </div>
         </div>
         <div class="toolbar compact">
-          <button class="btn-secondary" data-action="showLogin"><span class="btn-icon" aria-hidden="true">@</span>切换账号${tip("展开登录区，保存新的账号 Cookie 或 Token。")}</button>
+          <select id="accountImportBrowser" title="选择导入浏览器">${importBrowserOptions(DEFAULT_IMPORT_BROWSER)}</select>
           <button class="btn-secondary" data-action="importBrowserCookie"><span class="btn-icon" aria-hidden="true">↓</span>从浏览器导入${tip("重新从本机浏览器读取 nowcoder.com Cookie，适合网页登录态更新后使用。")}</button>
           <button class="btn-danger" data-action="logout"><span class="btn-icon" aria-hidden="true">×</span>退出${tip("清除插件保存的 Cookie、Token 和账号名。")}</button>
         </div>
@@ -3047,17 +3038,12 @@ function renderNowcoderAppHtml(webview) {
       <section id="loginSection" class="surface">
         <div class="section-head">
           <div>
-            <h2>${titled("登录牛客", "使用牛客账号密码登录；插件保存 Cookie 作为比赛报名、建目录、提交和提交记录的登录态。")}</h2>
+            <h2>${titled("登录牛客", "从已登录的浏览器导入 Cookie，或手动保存 Cookie / Token 作为插件登录态。")}</h2>
           </div>
           <span class="status-badge info">入口</span>
         </div>
-        <div class="grid">
-          <label>${label("牛客账号", "填写牛客网页登录使用的邮箱、手机号或账号名。")}<div class="input-wrap" data-icon="@"><input id="account" placeholder="邮箱 / 手机号" autocomplete="username"></div></label>
-          <label>${label("牛客密码", "只用于本次登录换取 Cookie，不会保存到 VSCode 存储里。")}<div class="input-wrap" data-icon="*"><input id="password" type="password" placeholder="登录密码" autocomplete="current-password"></div></label>
-          <label>${label("导入浏览器", "选择从哪个浏览器读取 nowcoder.com Cookie；自动会按 Chrome、Edge、Brave、Chromium、Arc 顺序查找。")}<select id="loginImportBrowser">${importBrowserOptions(DEFAULT_IMPORT_BROWSER)}</select></label>
-        </div>
         <div class="toolbar">
-          <button class="btn-primary" data-action="loginPassword"><span class="btn-icon" aria-hidden="true">✓</span>登录${tip("调用牛客登录接口，成功后保存当前账号的 Cookie。")}</button>
+          <select id="loginImportBrowser" title="选择导入浏览器">${importBrowserOptions(DEFAULT_IMPORT_BROWSER)}</select>
           <button class="btn-secondary" data-action="importBrowserCookie"><span class="btn-icon" aria-hidden="true">↓</span>从浏览器导入${tip("从已登录的 Chrome、Edge、Brave、Chromium 或 Arc 中读取 nowcoder.com 的 Cookie。")}</button>
         </div>
         <details class="advanced-auth">
@@ -3154,7 +3140,6 @@ function renderNowcoderAppHtml(webview) {
           <legend>${titled("界面设置", "控制牛客主页显示在 VSCode 左侧活动栏还是右侧辅助侧栏。")}</legend>
           <div class="grid">
             <label>${label("插件位置", "选择插件主页、公开比赛和提交记录视图出现在哪个侧边栏。")}<select id="interfacePosition"><option value="left">左侧</option><option value="right">右侧</option></select></label>
-            <label>${label("导入浏览器", "从浏览器导入登录态时优先读取哪个浏览器；自动会按已支持浏览器顺序查找。")}<select id="importBrowser">${importBrowserOptions(DEFAULT_IMPORT_BROWSER)}</select></label>
           </div>
         </fieldset>
         <fieldset class="setting-group">
@@ -3195,19 +3180,23 @@ function renderNowcoderAppHtml(webview) {
         </fieldset>
         <fieldset class="setting-group">
           <legend>${titled("模板", "按文件名配置新建代码文件的初始内容，模板变量会在创建目录时替换。")}</legend>
+          <div class="template-manager">
+            <div class="template-list-head">
+              <strong>已有模板 <span id="templateCount" class="count-badge">0</span></strong>
+            </div>
+            <div class="template-list" id="templateList"></div>
+          </div>
           <div class="template-builder">
             <div class="grid">
               <label>${label("语言", "选择模板对应的语言；插件会按语言填入一个常用代码文件名，你也可以自行修改。")}<select id="templateLanguage">${languageOptions("cpp")}</select></label>
               <label>${label("代码文件名", "这个文件名会加入创建题目时生成的代码文件列表，并作为模板匹配键。")}<div class="input-wrap" data-icon="{}"><input id="templateFileName" placeholder="main.cpp"></div></label>
             </div>
-            <label>${label("模板内容", "填写新建代码文件的初始内容；支持 {qid}、{title}、{contestId}、{index}、{problemId}、{timeLimit}、{memoryLimit}、{author}、{date}。")}<textarea id="templateContent" placeholder="#include &lt;bits/stdc++.h&gt;&#10;using namespace std;&#10;&#10;int main() {&#10;    ios::sync_with_stdio(false);&#10;    cin.tie(nullptr);&#10;    return 0;&#10;}"></textarea></label>
+            <label>${label("模板内容", "填写新建代码文件的初始内容；支持 {qid}、{title}、{contestId}、{index}、{problemId}、{timeLimit}、{memoryLimit}、{author}、{date}。")}<textarea id="templateContent"></textarea></label>
             <div class="toolbar compact">
-              <button class="btn-secondary" data-action="addTemplate"><span class="btn-icon" aria-hidden="true">+</span>添加/更新模板${tip("按当前文件名创建或更新模板，并同步加入代码文件名列表。")}</button>
+              <button class="btn-secondary" data-action="addTemplate"><span class="btn-icon" aria-hidden="true">✓</span><span id="templateActionLabel">添加模板</span>${tip("按当前文件名创建或更新模板，并同步加入代码文件名列表。")}</button>
               <button class="btn-danger" data-action="deleteTemplate"><span class="btn-icon" aria-hidden="true">×</span>删除当前模板${tip("删除当前文件名对应的模板；保存设置后才会永久生效。")}</button>
             </div>
           </div>
-          <div class="tabs" id="templateTabs"></div>
-          <div id="templateAreas"></div>
         </fieldset>
         <div class="toolbar">
           <button class="btn-primary" data-action="saveSettings"><span class="btn-icon" aria-hidden="true">✓</span>保存设置${tip("保存当前页面里的所有设置，并刷新账号专属配置。")}</button>
@@ -3216,11 +3205,15 @@ function renderNowcoderAppHtml(webview) {
     </main>
     <script nonce="${nonce}">
       const vscode = acquireVsCodeApi();
-      let state = { settings: {}, contests: [], history: [], submissions: [], submissionContestId: '', submissionContestName: '', lastSubmitResult: null, busy: false, showLogin: false, activeTab: 'contestId', contestFilter: 'future', activeFile: null };
+      let state = { settings: {}, contests: [], history: [], submissions: [], submissionContestId: '', submissionContestName: '', lastSubmitResult: null, busy: false, activeTab: 'contestId', contestFilter: 'future', activeFile: null };
+      let authChecking = false;
+      let authRefreshMessage = '';
       let autoSubmissionTimer = null;
       let lastAutoSubmissionContestId = '';
       let autoContestsRequested = false;
       let deletedTemplates = [];
+      let templateDrafts = {};
+      let activeTemplateName = '';
       const $ = id => document.getElementById(id);
       const post = (type, payload = {}) => vscode.postMessage({ type, ...payload });
       const templateFileByLanguage = ${JSON.stringify(TEMPLATE_FILE_BY_LANGUAGE)};
@@ -3269,21 +3262,17 @@ function renderNowcoderAppHtml(webview) {
       $('interfacePosition').addEventListener('change', () => {
         post('applyInterfacePosition', { position: $('interfacePosition').value });
       });
-      $('importBrowser').addEventListener('change', () => syncImportBrowserSelects('settings'));
       $('loginImportBrowser').addEventListener('change', () => syncImportBrowserSelects('login'));
+      $('accountImportBrowser').addEventListener('change', () => syncImportBrowserSelects('account'));
       $('templateLanguage').addEventListener('change', () => seedTemplateDraftForLanguage(true));
+      $('templateFileName').addEventListener('input', () => updateTemplateActionLabel());
       $('templateFileName').addEventListener('blur', () => loadTemplateDraft($('templateFileName').value));
 
       document.querySelectorAll('[data-action]').forEach(btn => {
         btn.addEventListener('click', () => {
           const action = btn.dataset.action;
-          if (action === 'loginPassword') {
-            post('loginPassword', { payload: { account: $('account').value, password: $('password').value, remember: true, token: $('token').value } });
-            $('password').value = '';
-            state.showLogin = false;
-          } else if (action === 'login') {
-            post('login', { payload: { account: $('account').value, token: $('token').value, cookie: $('cookie').value } });
-            state.showLogin = false;
+          if (action === 'login') {
+            post('login', { payload: { token: $('token').value, cookie: $('cookie').value } });
           } else if (action === 'saveSettings') {
             showNotice('正在保存设置...', 'loading');
             post('saveSettings', { payload: collectSettings() });
@@ -3305,11 +3294,10 @@ function renderNowcoderAppHtml(webview) {
           } else if (action === 'fetchContests') {
             autoContestsRequested = true;
             post('fetchContests');
-          } else if (action === 'showLogin') {
-            state.showLogin = !state.showLogin;
-            renderLoginVisibility(!!(state.auth && (state.auth.tokenConfigured || state.auth.cookieConfigured)));
           } else if (action === 'importBrowserCookie') {
             post('importBrowserCookie', { browser: selectedImportBrowser() });
+          } else if (action === 'logout') {
+            post('logout');
           } else {
             post(action);
           }
@@ -3326,6 +3314,11 @@ function renderNowcoderAppHtml(webview) {
           renderContests();
         } else if (msg.type === 'busy') {
           setBusy(!!msg.busy, msg.message || '');
+        } else if (msg.type === 'authRefresh') {
+          authChecking = !!msg.checking;
+          authRefreshMessage = msg.message || '';
+          renderAuth(state.auth || {}, null, !!(state.auth && (state.auth.tokenConfigured || state.auth.cookieConfigured)));
+          if (authRefreshMessage && msg.kind === 'warning') showNotice(authRefreshMessage, 'warning');
         } else if (msg.type === 'activeFile') {
           state.activeFile = msg || null;
           seedSubmissionContestFromActive();
@@ -3354,6 +3347,8 @@ function renderNowcoderAppHtml(webview) {
           lastSubmitResult: msg.lastSubmitResult !== undefined ? msg.lastSubmitResult : (state.lastSubmitResult || null),
           toast: msg.toast
         };
+        authChecking = false;
+        authRefreshMessage = '';
         if (msg.submissionContestId !== undefined && Array.isArray(msg.submissions)) {
           lastAutoSubmissionContestId = String(msg.submissionContestId || lastAutoSubmissionContestId || '');
         }
@@ -3363,7 +3358,6 @@ function renderNowcoderAppHtml(webview) {
         const auth = state.auth || {};
         const loggedIn = !!(auth.tokenConfigured || auth.cookieConfigured);
         renderAuth(auth, toast, loggedIn);
-        $('account').value = auth.account || $('account').value || '';
         renderLoginVisibility(loggedIn);
         $('mainTabs').classList.toggle('hidden', !loggedIn);
         renderPanels();
@@ -3377,7 +3371,7 @@ function renderNowcoderAppHtml(webview) {
 
       function renderLoginVisibility(loggedIn) {
         $('accountSection').classList.toggle('hidden', !loggedIn);
-        $('loginSection').classList.toggle('hidden', loggedIn && !state.showLogin);
+        $('loginSection').classList.toggle('hidden', loggedIn);
       }
 
       function renderPanels() {
@@ -3397,7 +3391,7 @@ function renderNowcoderAppHtml(webview) {
         const uid = auth.userId || '';
         const hasAuth = !!(auth.tokenConfigured || auth.cookieConfigured);
         const status = auth.acLogin ? 'ACM 已登录' : auth.judgeAuth ? '判题 Token 可用' : auth.cookieConfigured ? 'Cookie 待确认' : '未登录';
-        const title = loggedIn ? '已登录' : '请先登录';
+        const title = authChecking ? '正在检查登录状态...' : (authRefreshMessage || authStatusSummary(auth, loggedIn));
         setAuthText(title);
         if (toast) showNotice(toast, 'success');
         $('currentUserName').textContent = name || (hasAuth ? '未识别' : '-');
@@ -3406,8 +3400,15 @@ function renderNowcoderAppHtml(webview) {
         $('currentUserAvatar').textContent = userInitial(name || uid || 'N');
         $('currentUserDot').className = 'status-dot ' + (auth.acLogin ? 'ok' : auth.cookieConfigured || auth.judgeAuth ? 'warn' : 'bad');
         if (auth.cookieConfigured && !auth.acLogin && !toast) {
-          showNotice('已保存登录信息，但竞赛站未验证通过。请尝试“从浏览器导入”或重新登录。', 'warning');
+          showNotice('已保存登录信息，但竞赛站未验证通过。请先在浏览器登录牛客后再导入。', 'warning');
         }
+      }
+
+      function authStatusSummary(auth, loggedIn) {
+        if (!loggedIn) return '请先登录';
+        const errors = [auth.acError, auth.userError, auth.judgeError, auth.error].filter(Boolean);
+        if (errors.length) return '登录检查未完全通过：' + errors[0];
+        return '已登录';
       }
 
       function setBusy(busy, message) {
@@ -3669,8 +3670,8 @@ function renderNowcoderAppHtml(webview) {
 
       function renderSettings(s) {
         $('interfacePosition').value = s.interfacePosition || 'left';
-        $('importBrowser').value = s.importBrowser || 'chrome';
         $('loginImportBrowser').value = s.importBrowser || 'chrome';
+        $('accountImportBrowser').value = s.importBrowser || 'chrome';
         $('defaultLanguage').value = s.defaultLanguage || 'cpp';
         $('cLanguage').value = s.cLanguage || 'c_gcc10';
         $('cppLanguage').value = s.cppLanguage || 'cpp_clang18';
@@ -3739,30 +3740,43 @@ function renderNowcoderAppHtml(webview) {
       }
 
       function renderTemplates(templates) {
-        $('templateTabs').innerHTML = '';
-        $('templateAreas').innerHTML = '';
-        Object.keys(templates).forEach((name, index) => renderTemplateEditor(name, templates[name], index === 0));
+        templateDrafts = {};
+        Object.keys(templates || {}).sort(templateSort).forEach(name => {
+          const normalized = normalizeTemplateFileName(name);
+          if (normalized) templateDrafts[normalized] = templates[name] || '';
+        });
+        renderTemplateList();
       }
 
-      function renderTemplateEditor(name, value, active) {
-        if (!name || templateAreaByName(name)) return;
-        const tab = document.createElement('button');
-        tab.className = 'tab' + (active ? ' active' : '');
-        tab.innerHTML = '<span class="tab-name">' + esc(name) + '</span>';
-        tab.dataset.name = name;
-        tab.addEventListener('click', () => activateTemplate(tab.dataset.name));
-        $('templateTabs').appendChild(tab);
-        const area = document.createElement('textarea');
-        area.className = 'template' + (active ? ' active' : '');
-        area.dataset.name = name;
-        area.value = value || '';
-        $('templateAreas').appendChild(area);
+      function renderTemplateList() {
+        const list = $('templateList');
+        const names = Object.keys(templateDrafts).sort(templateSort);
+        $('templateCount').textContent = String(names.length);
+        list.innerHTML = '';
+        if (!names.length) {
+          list.innerHTML = '<div class="empty muted">暂无模板，选择语言后保存即可添加。</div>';
+          updateTemplateActionLabel();
+          return;
+        }
+        names.forEach(name => {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'template-row' + (name.toLowerCase() === String(activeTemplateName || '').toLowerCase() ? ' active' : '');
+          btn.dataset.name = name;
+          const lang = inferTemplateLanguage(name).toUpperCase();
+          const lines = String(templateDrafts[name] || '').split(String.fromCharCode(10)).length;
+          btn.innerHTML = '<span class="template-row-name">' + esc(name) + '</span><span class="template-row-meta">' + esc(lang) + ' · ' + lines + ' 行</span>';
+          btn.addEventListener('click', () => activateTemplate(btn.dataset.name));
+          list.appendChild(btn);
+        });
+        updateTemplateActionLabel();
       }
 
       function activateTemplate(name) {
-        document.querySelectorAll('.tab,.template').forEach(el => el.classList.remove('active'));
-        document.querySelectorAll('.tab').forEach(el => { if (el.dataset.name === name) el.classList.add('active'); });
-        document.querySelectorAll('.template').forEach(el => { if (el.dataset.name === name) el.classList.add('active'); });
+        const normalized = normalizeTemplateFileName(name);
+        if (!normalized) return;
+        activeTemplateName = normalized;
+        renderTemplateList();
         loadTemplateDraft(name);
       }
 
@@ -3774,43 +3788,38 @@ function renderNowcoderAppHtml(webview) {
         }
         $('templateFileName').value = name;
         deletedTemplates = deletedTemplates.filter(item => item.toLowerCase() !== name.toLowerCase());
-        const existing = templateAreaByName(name);
-        if (existing) {
-          existing.value = $('templateContent').value;
-        } else {
-          renderTemplateEditor(name, $('templateContent').value, true);
-        }
+        deleteTemplateDraft(name);
+        templateDrafts[name] = $('templateContent').value;
         ensureFileNameInList(name);
         activateTemplate(name);
-        notify('模板已加入当前设置：' + name);
+        notify('模板已保存到当前设置：' + name);
       }
 
       function deleteCurrentTemplate() {
-        const active = document.querySelector('.template.active');
-        const name = normalizeTemplateFileName($('templateFileName').value || (active && active.dataset.name));
+        const name = normalizeTemplateFileName($('templateFileName').value || activeTemplateName);
         if (!name) {
           notify('请选择或输入要删除的模板文件名。', 'warning');
           return;
         }
-        const area = templateAreaByName(name);
-        const tab = templateTabByName(name);
-        if (!area && !defaultTemplateByFile[name]) {
+        const existing = templateValueByName(name);
+        if (existing === undefined && defaultTemplateByFile[name] === undefined) {
           notify('当前没有这个模板：' + name, 'warning');
           return;
         }
         if (!deletedTemplates.some(item => item.toLowerCase() === name.toLowerCase())) {
           deletedTemplates.push(name);
         }
-        if (area) area.remove();
-        if (tab) tab.remove();
+        deleteTemplateDraft(name);
         removeFileNameFromList(name);
-        const next = document.querySelector('.tab');
+        const next = Object.keys(templateDrafts).sort(templateSort)[0];
         if (next) {
-          activateTemplate(next.dataset.name);
-          loadTemplateDraft(next.dataset.name);
+          activateTemplate(next);
         } else {
+          activeTemplateName = '';
+          renderTemplateList();
           $('templateFileName').value = name;
           $('templateContent').value = '';
+          updateTemplateActionLabel();
         }
         notify('模板已从当前设置中删除：' + name + '，保存设置后生效。');
       }
@@ -3821,10 +3830,10 @@ function renderNowcoderAppHtml(webview) {
         if (forceName || !normalizeTemplateFileName($('templateFileName').value)) {
           $('templateFileName').value = name;
         }
-        loadTemplateDraft($('templateFileName').value, lang);
+        loadTemplateDraft($('templateFileName').value, lang, { emptyWhenMissing: true });
       }
 
-      function loadTemplateDraft(fileName, preferredLanguage) {
+      function loadTemplateDraft(fileName, preferredLanguage, options = {}) {
         const name = normalizeTemplateFileName(fileName);
         if (!name) return;
         $('templateFileName').value = name;
@@ -3832,8 +3841,18 @@ function renderNowcoderAppHtml(webview) {
         if (lang && $('templateLanguage').querySelector('option[value="' + lang + '"]')) {
           $('templateLanguage').value = lang;
         }
-        const existing = templateAreaByName(name);
-        $('templateContent').value = existing ? existing.value : defaultTemplateForFile(name);
+        activeTemplateName = name;
+        renderTemplateList();
+        const existing = templateValueByName(name);
+        $('templateContent').value = existing !== undefined ? existing : (options.emptyWhenMissing ? '' : defaultTemplateForFile(name));
+        updateTemplateActionLabel();
+      }
+
+      function updateTemplateActionLabel() {
+        const label = $('templateActionLabel');
+        if (!label) return;
+        const name = normalizeTemplateFileName($('templateFileName').value || activeTemplateName);
+        label.textContent = name && templateValueByName(name) !== undefined ? '更新模板' : '添加模板';
       }
 
       function ensureFileNameInList(name) {
@@ -3852,12 +3871,24 @@ function renderNowcoderAppHtml(webview) {
         $('fileNames').value = joinLines(files);
       }
 
-      function templateAreaByName(name) {
-        return Array.from(document.querySelectorAll('.template')).find(area => area.dataset.name === name) || null;
+      function templateValueByName(name) {
+        const key = String(name || '').toLowerCase();
+        const found = Object.keys(templateDrafts).find(item => item.toLowerCase() === key);
+        return found ? templateDrafts[found] : undefined;
       }
 
-      function templateTabByName(name) {
-        return Array.from(document.querySelectorAll('.tab')).find(tab => tab.dataset.name === name) || null;
+      function deleteTemplateDraft(name) {
+        const key = String(name || '').toLowerCase();
+        Object.keys(templateDrafts).forEach(item => {
+          if (item.toLowerCase() === key) delete templateDrafts[item];
+        });
+      }
+
+      function templateSort(a, b) {
+        const priority = { 'main.cpp': 1, 'main.c': 2, 'Main.java': 3, 'main.py': 4 };
+        const pa = priority[a] || 10;
+        const pb = priority[b] || 10;
+        return pa === pb ? a.localeCompare(b) : pa - pb;
       }
 
       function defaultTemplateForFile(name) {
@@ -3877,7 +3908,7 @@ function renderNowcoderAppHtml(webview) {
           .split(String.fromCharCode(92)).join('/')
           .split('/')
           .map(part => part.trim())
-          .filter(Boolean)
+          .filter(part => part && part !== '.' && part !== '..')
           .join('/');
       }
 
@@ -3888,12 +3919,16 @@ function renderNowcoderAppHtml(webview) {
       }
 
       function collectSettings() {
+        const editingName = normalizeTemplateFileName($('templateFileName').value);
+        if (editingName && templateValueByName(editingName) !== undefined) {
+          templateDrafts[editingName] = $('templateContent').value;
+        }
         const templates = {};
-        document.querySelectorAll('.template').forEach(area => templates[area.dataset.name] = area.value);
+        Object.keys(templateDrafts).sort(templateSort).forEach(name => templates[name] = templateDrafts[name]);
         Object.keys(templates).forEach(name => {
           deletedTemplates = deletedTemplates.filter(item => item.toLowerCase() !== name.toLowerCase());
         });
-        const fileNames = mergeFileNamesFromTemplates(splitLines($('fileNames').value), Object.keys(templates), deletedTemplates);
+        const fileNames = normalizeGeneratedFileNamesForWebview(splitLines($('fileNames').value));
         return {
           interfacePosition: $('interfacePosition').value,
           importBrowser: selectedImportBrowser(),
@@ -3920,18 +3955,17 @@ function renderNowcoderAppHtml(webview) {
         };
       }
 
-      function mergeFileNamesFromTemplates(savedFiles, templateNames, deletedNames) {
-        const deleted = new Set((deletedNames || []).map(name => String(name || '').toLowerCase()));
+      function normalizeGeneratedFileNamesForWebview(savedFiles) {
         const seen = new Set();
         const files = [];
-        ['main.cpp', 'main.c', 'Main.java', 'main.py'].concat(templateNames || [], savedFiles || []).forEach(name => {
+        (savedFiles && savedFiles.length ? savedFiles : ['main.cpp', 'main.c', 'Main.java', 'main.py']).forEach(name => {
           const value = normalizeTemplateFileName(name);
           const key = value.toLowerCase();
-          if (!value || seen.has(key) || deleted.has(key)) return;
+          if (!value || seen.has(key)) return;
           seen.add(key);
           files.push(value);
         });
-        return files;
+        return files.length ? files : ['main.cpp', 'main.c', 'Main.java', 'main.py'];
       }
 
       function formatTime(value) {
@@ -4041,11 +4075,15 @@ function renderNowcoderAppHtml(webview) {
         const normalized = String(value || '').split(String.fromCharCode(92, 110)).join(String.fromCharCode(10));
         return normalized.split(/\\r?\\n/).map(s => s.trim()).filter(Boolean);
       }
-      function selectedImportBrowser() { return ($('loginImportBrowser') && $('loginImportBrowser').value) || ($('importBrowser') && $('importBrowser').value) || 'chrome'; }
+      function selectedImportBrowser() {
+        const auth = state.auth || {};
+        if ((auth.tokenConfigured || auth.cookieConfigured) && $('accountImportBrowser')) return $('accountImportBrowser').value || 'chrome';
+        return ($('loginImportBrowser') && $('loginImportBrowser').value) || ($('accountImportBrowser') && $('accountImportBrowser').value) || 'chrome';
+      }
       function syncImportBrowserSelects(source) {
-        const value = source === 'login' ? $('loginImportBrowser').value : $('importBrowser').value;
-        $('loginImportBrowser').value = value;
-        $('importBrowser').value = value;
+        const value = source === 'account' ? $('accountImportBrowser').value : $('loginImportBrowser').value;
+        if ($('loginImportBrowser')) $('loginImportBrowser').value = value;
+        if ($('accountImportBrowser')) $('accountImportBrowser').value = value;
       }
       function cssName(name) { return String(name).replace(/"/g, '\\\\"'); }
       function esc(s) { return String(s ?? '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch])); }
@@ -4161,8 +4199,6 @@ function baseHtml(body, options = {}) {
     .tab { position: relative; gap: 6px; border-width: 0 0 2px; border-radius: 0; background: transparent; color: var(--vscode-descriptionForeground); padding: 5px 7px; min-height: 28px; }
     .tab:hover { box-shadow: none; }
     .tab.active { color: var(--vscode-foreground); border-color: var(--vscode-button-background); background: color-mix(in srgb, var(--vscode-button-background) 9%, transparent); }
-    .template { display: none; min-height: 260px; line-height: 1.42; }
-    .template.active { display: block; }
     .hidden { display: none !important; }
     .surface, .panel { min-width: 0; max-width: 100%; overflow-x: hidden; overflow-x: clip; border: 1px solid var(--vscode-panel-border); border-radius: 7px; padding: 7px; margin-bottom: 7px; background: color-mix(in srgb, var(--vscode-editorWidget-background, var(--vscode-editor-background)) 52%, var(--vscode-editor-background)); box-shadow: 0 1px 0 rgba(0,0,0,.08); }
     .section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; min-width: 0; max-width: 100%; margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid var(--vscode-panel-border); }
@@ -4274,11 +4310,19 @@ function baseHtml(body, options = {}) {
     .setting-group legend { color: var(--vscode-foreground); font-size: 13px; font-weight: 650; padding: 0 6px; }
     .example-box { display: grid; gap: 3px; min-width: 0; max-width: 100%; margin: 8px 0; padding: 7px 8px; border: 1px dashed var(--vscode-panel-border); border-radius: 7px; background: var(--vscode-editorWidget-background); }
     .example-box strong { color: var(--vscode-foreground); font-size: 12px; }
+    .template-manager { display: grid; gap: 6px; min-width: 0; max-width: 100%; margin: 3px 0 8px; }
+    .template-list-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; min-width: 0; max-width: 100%; color: var(--vscode-foreground); }
+    .template-list-head strong { display: inline-flex; align-items: center; gap: 6px; min-width: 0; font-size: 12px; }
+    .template-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(132px, 100%), 1fr)); gap: 4px; min-width: 0; max-width: 100%; }
+    .template-row { display: grid; grid-template-columns: minmax(0, 1fr); justify-items: start; gap: 2px; min-height: 34px; padding: 5px 7px; text-align: left; background: var(--vscode-editorWidget-background); color: var(--vscode-foreground); border-color: var(--vscode-panel-border); }
+    .template-row:hover { background: var(--vscode-list-hoverBackground); }
+    .template-row.active { border-color: var(--vscode-button-background); background: color-mix(in srgb, var(--vscode-button-background) 13%, var(--vscode-editorWidget-background)); }
+    .template-row-name { max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
+    .template-row-meta { color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.2; }
     .template-builder { display: grid; gap: 7px; min-width: 0; max-width: 100%; margin-bottom: 9px; padding: 7px; border: 1px solid var(--vscode-panel-border); border-radius: 7px; background: var(--vscode-editorWidget-background); }
-    .template-builder textarea { min-height: 150px; }
+    .template-builder textarea { min-height: 220px; }
     .item .meta { line-height: 1.45; overflow-wrap: anywhere; }
     .app textarea { min-height: 76px; }
-    .app #templateAreas textarea { min-height: 260px; }
     @media (max-width: 390px) {
       main { padding: 6px; }
       .grid { grid-template-columns: 1fr; }
@@ -4318,6 +4362,11 @@ async function saveSettingsFromWebview(payload, context, client) {
   await cfg.update("rootPath", settings.rootPath, target);
   await cfg.update("authorName", settings.authorName, target);
   await cfg.update("publicContestCategories", settings.publicContestCategories, target);
+  await cfg.update("requestTimeoutMs", settings.requestTimeoutMs, target);
+  await cfg.update("requestRetries", settings.requestRetries, target);
+  await cfg.update("maxRankPages", settings.maxRankPages, target);
+  await cfg.update("maxSubmissionPages", settings.maxSubmissionPages, target);
+  await cfg.update("prepareConcurrency", settings.prepareConcurrency, target);
   await cfg.update("createStatementMarkdown", settings.createStatementMarkdown, target);
   await cfg.update("openCreatedFile", settings.openCreatedFile, target);
   await cfg.update("fileNames", settings.fileNames, target);
@@ -4387,7 +4436,12 @@ function config() {
 async function loadAccountSettings(context, client) {
   const defaults = defaultSettings();
   const key = await accountSettingsKey(client);
-  return normalizeSettings({ ...defaults, ...(context.globalState.get(key, {}) || {}) });
+  const accountSettings = context.globalState.get(key, {}) || {};
+  return normalizeSettings({
+    ...defaults,
+    ...accountSettings,
+    fileNames: defaults.fileNames
+  });
 }
 
 function defaultSettings() {
@@ -4409,6 +4463,11 @@ function defaultSettings() {
     rootPath: cfg.get("rootPath", ""),
     authorName: cfg.get("authorName", ""),
     publicContestCategories: cfg.get("publicContestCategories", [13, 14, 15]),
+    requestTimeoutMs: cfg.get("requestTimeoutMs", DEFAULT_REQUEST_TIMEOUT_MS),
+    requestRetries: cfg.get("requestRetries", 1),
+    maxRankPages: cfg.get("maxRankPages", DEFAULT_MAX_RANK_PAGES),
+    maxSubmissionPages: cfg.get("maxSubmissionPages", DEFAULT_MAX_SUBMISSION_PAGES),
+    prepareConcurrency: cfg.get("prepareConcurrency", DEFAULT_PREPARE_CONCURRENCY),
     createStatementMarkdown: cfg.get("createStatementMarkdown", true),
     openCreatedFile: cfg.get("openCreatedFile", true),
     interfacePosition: cfg.get("interfacePosition", "left"),
@@ -4420,6 +4479,8 @@ function defaultSettings() {
 
 function normalizeSettings(payload) {
   const defaults = defaultSettings();
+  const payloadFileNames = normalizeFileNames(payload.fileNames);
+  const defaultFileNames = normalizeFileNames(defaults.fileNames);
   return {
     interfacePosition: normalizeInterfacePosition(payload.interfacePosition || defaults.interfacePosition),
     defaultLanguage: payload.defaultLanguage || defaults.defaultLanguage || "cpp",
@@ -4438,30 +4499,30 @@ function normalizeSettings(payload) {
     rootPath: String(payload.rootPath || defaults.rootPath || "").trim(),
     authorName: payload.authorName !== undefined ? String(payload.authorName || "").trim() : String(defaults.authorName || "").trim(),
     publicContestCategories: Array.isArray(payload.publicContestCategories) && payload.publicContestCategories.length ? payload.publicContestCategories : defaults.publicContestCategories,
+    requestTimeoutMs: clampPositiveInt(payload.requestTimeoutMs, defaults.requestTimeoutMs || DEFAULT_REQUEST_TIMEOUT_MS, 1000, 120000),
+    requestRetries: clampPositiveInt(payload.requestRetries, defaults.requestRetries || 1, 1, 5),
+    maxRankPages: clampPositiveInt(payload.maxRankPages, defaults.maxRankPages || DEFAULT_MAX_RANK_PAGES, 1, 200),
+    maxSubmissionPages: clampPositiveInt(payload.maxSubmissionPages, defaults.maxSubmissionPages || DEFAULT_MAX_SUBMISSION_PAGES, 1, 500),
+    prepareConcurrency: clampPositiveInt(payload.prepareConcurrency, defaults.prepareConcurrency || DEFAULT_PREPARE_CONCURRENCY, 1, 10),
     createStatementMarkdown: payload.createStatementMarkdown !== undefined ? !!payload.createStatementMarkdown : defaults.createStatementMarkdown,
     openCreatedFile: payload.openCreatedFile !== undefined ? !!payload.openCreatedFile : defaults.openCreatedFile,
-    fileNames: normalizeGeneratedFileNames(
-      normalizeFileNames(payload.fileNames).length ? normalizeFileNames(payload.fileNames) : normalizeFileNames(defaults.fileNames),
-      payload.templates || defaults.templates || {},
-      payload.deletedTemplates || defaults.deletedTemplates || []
-    ),
+    fileNames: normalizeGeneratedFileNames(payloadFileNames.length ? payloadFileNames : defaultFileNames),
     templates: mergeDefaultTemplates(payload.templates || defaults.templates || {}, payload.deletedTemplates || defaults.deletedTemplates || []),
     deletedTemplates: normalizeDeletedTemplates(payload.deletedTemplates || defaults.deletedTemplates || [])
   };
 }
 
-function normalizeGeneratedFileNames(fileNames, templates = {}, deletedTemplates = []) {
-  const deleted = new Set(normalizeDeletedTemplates(deletedTemplates).map(name => name.toLowerCase()));
+function normalizeGeneratedFileNames(fileNames) {
   const seen = new Set();
   const files = [];
-  for (const file of [...DEFAULT_CODE_FILES, ...Object.keys(templates || {}), ...normalizeFileNames(fileNames)]) {
+  for (const file of normalizeFileNames(fileNames)) {
     const name = normalizeTemplateFileName(file);
     const key = name.toLowerCase();
-    if (!name || seen.has(key) || deleted.has(key)) continue;
+    if (!name || seen.has(key)) continue;
     seen.add(key);
     files.push(name);
   }
-  return ensureCoreCodeFiles(files);
+  return files.length ? files : DEFAULT_CODE_FILES.slice();
 }
 
 function mergeDefaultTemplates(templates, deletedTemplates = []) {
@@ -4485,6 +4546,16 @@ function normalizeDeletedTemplates(value) {
     names.push(name);
   }
   return names;
+}
+
+function configuredPositiveInt(key, fallback, min, max) {
+  return clampPositiveInt(config().get(key, fallback), fallback, min, max);
+}
+
+function clampPositiveInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
+  const n = Number(value);
+  const base = Number.isFinite(n) && n > 0 ? Math.trunc(n) : Math.trunc(Number(fallback) || min || 1);
+  return Math.min(Math.max(base, min), max);
 }
 
 function normalizeLanguageVersion(group, value) {
@@ -4543,20 +4614,8 @@ function normalizeTemplateFileName(value) {
     .replace(/\\/g, "/")
     .split("/")
     .map(part => part.trim())
-    .filter(Boolean)
+    .filter(part => part && part !== "." && part !== "..")
     .join("/");
-}
-
-function ensureCoreCodeFiles(value) {
-  const seen = new Set();
-  const files = [];
-  for (const file of [...normalizeFileNames(value), ...DEFAULT_CODE_FILES]) {
-    const key = file.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    files.push(file);
-  }
-  return files;
 }
 
 async function accountSettingsKey(client) {
@@ -4564,6 +4623,14 @@ async function accountSettingsKey(client) {
   const token = await client.getQuestionbankToken();
   const source = extractCookieValue(cookie, "NOWCODERUID") || extractCookieValue(cookie, "NOWCODERCLINETID") || token || "default";
   return `${ACCOUNT_SETTINGS_PREFIX}${hashId(source)}`;
+}
+
+async function accountHistoryKey(client) {
+  const cookie = client ? await client.getCookie() : "";
+  const token = client ? await client.getQuestionbankToken() : "";
+  const account = client ? await client.getAccountName() : "";
+  const source = extractCookieValue(cookie, "NOWCODERUID") || extractCookieValue(cookie, "NOWCODERCLINETID") || token || account || "default";
+  return `${ACCOUNT_HISTORY_PREFIX}${hashId(source)}`;
 }
 
 async function getQidFromItemOrPrompt(item) {
@@ -4796,10 +4863,14 @@ async function saveProblemBinding(context, dir, meta) {
   await fsp.writeFile(path.join(dir, "nowcoder.json"), `${JSON.stringify(meta, null, 2)}\n`, "utf8");
 }
 
-async function pushSubmissionHistory(context, row) {
-  const history = context.globalState.get(HISTORY_KEY, []);
-  history.unshift(row);
-  await context.globalState.update(HISTORY_KEY, history.slice(0, 100));
+async function pushSubmissionHistory(context, row, client) {
+  const keys = [HISTORY_KEY];
+  if (client) keys.unshift(await accountHistoryKey(client));
+  for (const key of keys) {
+    const history = context.globalState.get(key, []);
+    history.unshift(row);
+    await context.globalState.update(key, history.slice(0, 100));
+  }
 }
 
 function normalizeSubmitResultForView(update = {}, previous = null) {
@@ -4942,13 +5013,24 @@ const MAC_CHROMIUM_BROWSERS = [
   { id: "chromium", browser: "Chromium", supportPath: ["Chromium"], safeStorage: "Chromium Safe Storage" },
   { id: "arc", browser: "Arc", supportPath: ["Arc", "User Data"], safeStorage: "Arc Safe Storage" }
 ];
+const WIN_CHROMIUM_BROWSERS = [
+  { id: "chrome", browser: "Google Chrome", roots: [["LOCALAPPDATA", "Google", "Chrome", "User Data"]] },
+  { id: "edge", browser: "Microsoft Edge", roots: [["LOCALAPPDATA", "Microsoft", "Edge", "User Data"]] },
+  { id: "brave", browser: "Brave", roots: [["LOCALAPPDATA", "BraveSoftware", "Brave-Browser", "User Data"]] },
+  { id: "chromium", browser: "Chromium", roots: [["LOCALAPPDATA", "Chromium", "User Data"]] },
+  { id: "arc", browser: "Arc", roots: [["LOCALAPPDATA", "Packages", "TheBrowserCompany.Arc_ttt1ap7aakyb4", "LocalCache", "Local", "Arc", "User Data"]] }
+];
+const LINUX_CHROMIUM_BROWSERS = [
+  { id: "chrome", browser: "Google Chrome", roots: [["HOME", ".config", "google-chrome"], ["HOME", ".var", "app", "com.google.Chrome", "config", "google-chrome"]] },
+  { id: "edge", browser: "Microsoft Edge", roots: [["HOME", ".config", "microsoft-edge"]] },
+  { id: "brave", browser: "Brave", roots: [["HOME", ".config", "BraveSoftware", "Brave-Browser"], ["HOME", ".var", "app", "com.brave.Browser", "config", "BraveSoftware", "Brave-Browser"]] },
+  { id: "chromium", browser: "Chromium", roots: [["HOME", ".config", "chromium"], ["HOME", "snap", "chromium", "common", "chromium"], ["HOME", ".var", "app", "org.chromium.Chromium", "config", "chromium"]] },
+  { id: "arc", browser: "Arc", roots: [] }
+];
 
 async function importNowcoderCookieFromBrowsers(browserPreference = DEFAULT_IMPORT_BROWSER) {
-  if (process.platform !== "darwin") {
-    throw new Error("当前自动浏览器导入只支持 macOS。");
-  }
   const selected = normalizeImportBrowser(browserPreference);
-  const profiles = await findMacChromiumCookieProfiles(selected);
+  const profiles = await findChromiumCookieProfiles(selected);
   if (!profiles.length) {
     throw new Error(selected === IMPORT_BROWSER_AUTO ? "没有找到 Chrome/Edge/Brave/Chromium/Arc 的 Cookie 数据库。" : `没有找到 ${importBrowserLabel(selected)} 的 Cookie 数据库。`);
   }
@@ -4965,8 +5047,12 @@ async function importNowcoderCookieFromBrowsers(browserPreference = DEFAULT_IMPO
         if (!name) continue;
         let value = row.value || "";
         if (!value && row.encryptedHex) {
-          if (!password) password = await getMacSafeStoragePassword(profile.safeStorage);
-          value = decryptMacChromiumCookie(row.encryptedHex, password, row.host_key || row.hostKey || "");
+          if (profile.platform === "darwin") {
+            if (!password) password = await getMacSafeStoragePassword(profile.safeStorage);
+            value = decryptMacChromiumCookie(row.encryptedHex, password, row.host_key || row.hostKey || "");
+          } else {
+            value = decryptNonMacChromiumCookie(row.encryptedHex);
+          }
         }
         if (value) jar.map.set(name, value);
       }
@@ -4989,6 +5075,13 @@ async function importNowcoderCookieFromBrowsers(browserPreference = DEFAULT_IMPO
   throw new Error(`没有从${target}里找到有效的牛客登录态。请先在${target}登录牛客后再试。${suffix}`);
 }
 
+async function findChromiumCookieProfiles(browserPreference = DEFAULT_IMPORT_BROWSER) {
+  if (process.platform === "darwin") return findMacChromiumCookieProfiles(browserPreference);
+  if (process.platform === "win32") return findGenericChromiumCookieProfiles(WIN_CHROMIUM_BROWSERS, browserPreference, "win32");
+  if (process.platform === "linux") return findGenericChromiumCookieProfiles(LINUX_CHROMIUM_BROWSERS, browserPreference, "linux");
+  throw new Error(`当前平台 ${process.platform} 暂不支持自动浏览器导入。`);
+}
+
 async function findMacChromiumCookieProfiles(browserPreference = DEFAULT_IMPORT_BROWSER) {
   const result = [];
   const appSupport = path.join(os.homedir(), "Library", "Application Support");
@@ -5008,6 +5101,7 @@ async function findMacChromiumCookieProfiles(browserPreference = DEFAULT_IMPORT_
         if (await exists(cookieFile)) {
           result.push({
             browser: def.browser,
+            platform: "darwin",
             safeStorage: def.safeStorage,
             profileName: path.basename(dir),
             cookieFile
@@ -5017,6 +5111,43 @@ async function findMacChromiumCookieProfiles(browserPreference = DEFAULT_IMPORT_
     }
   }
   return result;
+}
+
+async function findGenericChromiumCookieProfiles(browserDefs, browserPreference = DEFAULT_IMPORT_BROWSER, platformName = process.platform) {
+  const result = [];
+  const selected = normalizeImportBrowser(browserPreference);
+  const defs = selected === IMPORT_BROWSER_AUTO ? browserDefs : browserDefs.filter(item => item.id === selected);
+  for (const def of defs) {
+    for (const rootSpec of def.roots || []) {
+      const base = resolveEnvPath(rootSpec);
+      if (!base || !await exists(base)) continue;
+      const candidates = [base];
+      const entries = await fsp.readdir(base, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (entry.isDirectory()) candidates.push(path.join(base, entry.name));
+      }
+      for (const dir of candidates) {
+        for (const relative of [path.join("Network", "Cookies"), "Cookies"]) {
+          const cookieFile = path.join(dir, relative);
+          if (await exists(cookieFile)) {
+            result.push({
+              browser: def.browser,
+              platform: platformName,
+              profileName: path.basename(dir),
+              cookieFile
+            });
+          }
+        }
+      }
+    }
+  }
+  return result;
+}
+
+function resolveEnvPath(parts) {
+  const [envName, ...rest] = parts || [];
+  const root = process.env[envName] || (envName === "HOME" ? os.homedir() : "");
+  return root ? path.join(root, ...rest) : "";
 }
 
 async function readCookieRows(cookieFile) {
@@ -5064,6 +5195,16 @@ function decryptMacChromiumCookie(encryptedHex, password, hostKey) {
     if (decrypted.subarray(0, 32).equals(digest)) decrypted = decrypted.subarray(32);
   }
   return decrypted.toString("utf8");
+}
+
+function decryptNonMacChromiumCookie(encryptedHex) {
+  const encrypted = Buffer.from(String(encryptedHex || ""), "hex");
+  if (!encrypted.length) return "";
+  const prefix = encrypted.slice(0, 3).toString("utf8");
+  if (prefix === "v10" || prefix === "v11" || prefix === "v20" || encrypted.length > 32) {
+    throw new Error("浏览器 Cookie 已加密，当前平台暂不能直接解密；请改用手动粘贴 Cookie。");
+  }
+  return encrypted.toString("utf8");
 }
 
 function isNowcoderCookieHost(host) {
@@ -5125,19 +5266,6 @@ function stripCookieQuotes(value) {
   return text.length >= 2 && text.startsWith('"') && text.endsWith('"') ? text.slice(1, -1) : text;
 }
 
-function encryptPassword(password, publicKey) {
-  const compact = String(publicKey || "").replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
-  const body = compact.match(/.{1,64}/g).join("\n");
-  const pem = `-----BEGIN PUBLIC KEY-----\n${body}\n-----END PUBLIC KEY-----`;
-  return crypto.publicEncrypt(
-    {
-      key: pem,
-      padding: crypto.constants.RSA_PKCS1_PADDING
-    },
-    Buffer.from(String(password), "utf8")
-  ).toString("base64");
-}
-
 function isContestSignedUp(contest) {
   return !!(contest && (contest.isSignUp || Number(contest.signUpId || 0) > 0));
 }
@@ -5148,6 +5276,15 @@ function shouldRefreshAuth(auth) {
   const cachedAt = Date.parse(auth.cachedAt || "");
   if (!Number.isFinite(cachedAt)) return true;
   return Date.now() - cachedAt > AUTH_CACHE_TTL_MS;
+}
+
+function authStatusMessage(auth) {
+  if (!auth || !(auth.tokenConfigured || auth.cookieConfigured)) return "未配置登录信息。";
+  const errors = [auth.acError, auth.userError, auth.judgeError, auth.error].filter(Boolean);
+  if (auth.acLogin || auth.judgeAuth) {
+    return errors.length ? `登录检查完成，部分接口失败：${errors[0]}` : "登录检查完成。";
+  }
+  return errors.length ? `登录检查未通过：${errors[0]}` : "登录检查未通过。";
 }
 
 function normalizeUserInfo(data) {
@@ -6069,7 +6206,9 @@ function safePathName(name) {
 }
 
 function safeRelativeFileName(name) {
-  const parts = String(name || "main.cpp").split(/[\\/]+/).map(safePathName).filter(Boolean);
+  const parts = String(name || "main.cpp").split(/[\\/]+/)
+    .map(safePathName)
+    .filter(part => part && part !== "." && part !== "..");
   return parts.join(path.sep) || "main.cpp";
 }
 
@@ -6166,6 +6305,38 @@ function toDate(value) {
   const n = Number(value);
   const date = Number.isFinite(n) ? new Date(n > 0 && n < 100000000000 ? n * 1000 : n) : new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
+  const timeout = Math.max(1000, Number(timeoutMs) || DEFAULT_REQUEST_TIMEOUT_MS);
+  if (typeof AbortController !== "function") return fetch(url, options);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      throw new Error(`请求超时 (${timeout}ms)`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function requestAttemptCount(options = {}) {
+  if (options.retries !== undefined) return clampPositiveInt(options.retries, 1, 1, 5);
+  const method = String(options.method || "GET").toUpperCase();
+  if (method !== "GET") return 1;
+  return configuredPositiveInt("requestRetries", 1, 1, 5);
+}
+
+function isRetryableRequestError(err) {
+  const text = String(err && err.message || err || "").toLowerCase();
+  return /timeout|timed out|超时|econnreset|econnrefused|enotfound|eai_again|network|fetch failed|socket hang up/.test(text);
 }
 
 function requestTextWithNodeHttp(url, options = {}) {
@@ -6346,5 +6517,35 @@ function showError(err) {
 
 module.exports = {
   activate,
-  deactivate
+  deactivate,
+  _test: {
+    applyTemplate,
+    cleanHtmlText,
+    codeHeaderInsertOffset,
+    decodeHtml,
+    extractAcmLimitInfo,
+    firstPresent,
+    formatMemoryLimit,
+    formatSubmissionMemory,
+    formatSubmissionRuntime,
+    formatTimeLimit,
+    htmlToMarkdown,
+    inferProblemMetaFromPath,
+    normalizeContestSubmission,
+    normalizeGeneratedFileNames,
+    normalizeImportBrowser,
+    normalizeProblemLike,
+    normalizeSubmissionCodeValue,
+    normalizeTemplateFileName,
+    parseContestDirName,
+    parseProblemDirName,
+    renderNowcoderAppHtml,
+    requestAttemptCount,
+    resolveEnvPath,
+    safePathName,
+    safeRelativeFileName,
+    stripContestIdFromName,
+    upsertCodeFileHeader,
+    vscodeLanguageFromSubmission
+  }
 };

@@ -1,9 +1,10 @@
 const { spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const manifest = require("../package.json");
 
 const root = path.resolve(__dirname, "..");
-const vsix = path.join(root, "nowcoder-helper-0.1.4.vsix");
+const vsix = path.join(root, `${manifest.name}-${manifest.version}.vsix`);
 const candidates = [
   process.env.VSCODE_CLI,
   "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",

@@ -777,17 +777,21 @@ class NowcoderClient {
     const contestId = problem && problem.contestId;
     const index = problem && problem.index;
     const problemId = problem && problem.problemId;
+    const teamId = problem && problem.teamId;
     let url = "";
+    let referer = "";
     if (contestId && index) {
-      url = `${NOWCODER_ACM_BASE}/acm/contest/${Number(contestId)}/${encodeURIComponent(index)}`;
+      url = withQueryParam(`${NOWCODER_ACM_BASE}/acm/contest/${Number(contestId)}/${encodeURIComponent(index)}`, "teamId", teamId);
+      referer = withQueryParam(`${NOWCODER_ACM_BASE}/acm/contest/${Number(contestId)}`, "teamId", teamId);
     } else if (problemId) {
       url = `${NOWCODER_ACM_BASE}/acm/problem/${Number(problemId)}`;
+      referer = `${NOWCODER_ACM_BASE}/acm/problem/list`;
     } else {
       throw new Error("缺少 contestId/index 或 problemId，无法从 ACM 页面拉取题面。");
     }
     const html = await this.requestText(url, {
       cookieRequired: true,
-      referer: contestId ? `${NOWCODER_ACM_BASE}/acm/contest/${Number(contestId)}` : `${NOWCODER_ACM_BASE}/acm/problem/list`
+      referer
     });
     return parseAcmProblemPage(html, problem);
   }
@@ -2233,11 +2237,12 @@ async function createProblemCommand(context, client, item) {
       if (!qid) return;
       problem = { qid, questionId: qid, index: `Q${qid}`, title: "" };
     }
+    const settings = await runtimeSettings(context, client);
     const root = await pickRootDirectory(context, client);
     if (!root) return;
     const created = await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: "创建题目文件夹" },
-      () => prepareProblemFolder(context, client, problem, root, { open: true })
+      () => prepareProblemFolder(context, client, problem, root, { open: true, settings })
     );
     vscode.window.showInformationMessage(`已创建：${created.dir}`);
   } catch (err) {
@@ -2486,11 +2491,12 @@ async function prepareContestCommand(context, client, item) {
     const contest = await getContestFromItemOrPrompt(client, item);
     if (!contest) return;
     await client.requireCookie();
+    const settings = await runtimeSettings(context, client);
     const root = await pickRootDirectory(context, client);
     if (!root) return;
     const authorName = await resolveAuthorName(client);
     const contestName = contest.contestName || contest.name || `contest_${contest.contestId}`;
-    const contestDirName = applyTemplate(config().get("contestFolderName", "{name}（{contestId}）"), {
+    const contestDirName = applyTemplate(settings.contestFolderName || "{name}（{contestId}）", {
       name: contestName,
       contestId: contest.contestId
     });
@@ -2502,9 +2508,9 @@ async function prepareContestCommand(context, client, item) {
       async progress => {
         const problems = await client.getContestProblemMappings(contest.contestId, progress);
         const rows = [];
-        const concurrency = configuredPositiveInt("prepareConcurrency", DEFAULT_PREPARE_CONCURRENCY, 1, 10);
+        const concurrency = clampPositiveInt(settings.prepareConcurrency, DEFAULT_PREPARE_CONCURRENCY, 1, 10);
         const preparedRows = await mapLimit(problems, concurrency, async problem => {
-          const created = await prepareProblemFolder(context, client, normalizeProblemLike({ ...problem, contestName }), contestDir, { open: false, tolerateStatementError: true, authorName });
+          const created = await prepareProblemFolder(context, client, normalizeProblemLike({ ...problem, contestName }), contestDir, { open: false, tolerateStatementError: true, authorName, settings });
           return { ...problem, ...created };
         });
         rows.push(...preparedRows);
@@ -2513,7 +2519,7 @@ async function prepareContestCommand(context, client, item) {
     );
     const okCount = prepared.filter(item => item.dir).length;
     const firstCreated = prepared.find(item => Array.isArray(item.files) && item.files.length);
-    if (config().get("openCreatedFile", true) && firstCreated) {
+    if (settings.openCreatedFile !== false && firstCreated) {
       const doc = await vscode.workspace.openTextDocument(firstCreated.files[0]);
       await vscode.window.showTextDocument(doc, { preview: false });
     }
@@ -2567,24 +2573,14 @@ async function openSettingsCommand() {
 }
 
 async function prepareProblemFolder(context, client, problem, baseDir, options = {}) {
-  const cfg = config();
+  const settings = options.settings || await runtimeSettings(context, client);
   const authorName = options.authorName !== undefined ? String(options.authorName || "").trim() : await resolveAuthorName(client);
   let question = null;
   let statement = "";
   let statementError = "";
   let qid = problem.questionId || problem.qid;
 
-  if (qid) {
-    try {
-      question = await client.fetchQuestionRecord(qid);
-      problem.title = problem.title || question.title || "";
-      statement = formatQuestionMarkdown(question);
-    } catch (err) {
-      statementError = err.message;
-      if (!options.tolerateStatementError) throw err;
-    }
-  }
-  if (!statement && (problem.problemId || problem.contestId && problem.index)) {
+  if (problem.problemId || problem.contestId && problem.index) {
     try {
       const acm = await client.fetchAcmProblemStatement(problem);
       statement = acm.markdown;
@@ -2601,6 +2597,17 @@ async function prepareProblemFolder(context, client, problem, baseDir, options =
       problem.selfType = problem.selfType || acm.selfType || "";
       problem.codeJudgeType = problem.codeJudgeType || acm.codeJudgeType || "";
       problem.supportLang = problem.supportLang || acm.supportLang || "";
+      statementError = "";
+    } catch (err) {
+      statementError = err.message;
+      if (!qid && !options.tolerateStatementError) throw err;
+    }
+  }
+  if (!statement && qid) {
+    try {
+      question = await client.fetchQuestionRecord(qid);
+      problem.title = problem.title || question.title || "";
+      statement = formatQuestionMarkdown(question);
       statementError = "";
     } catch (err) {
       statementError = statementError ? `${statementError}\n${err.message}` : err.message;
@@ -2621,7 +2628,7 @@ async function prepareProblemFolder(context, client, problem, baseDir, options =
     author: authorName || "用户未配置",
     date: new Date().toISOString().slice(0, 10)
   };
-  const folderPattern = cfg.get("problemFolderName", "{index}_{title}");
+  const folderPattern = settings.problemFolderName || "{index}_{title}";
   const folderName = safePathName(applyTemplate(folderPattern, vars) || `${vars.index}_${vars.title || vars.qid || vars.problemId}`);
   const dir = path.join(baseDir, folderName);
   await fsp.mkdir(dir, { recursive: true });
@@ -2636,14 +2643,14 @@ async function prepareProblemFolder(context, client, problem, baseDir, options =
   }
   if (!problem.problemId && existingStatementMeta.problemId) problem.problemId = existingStatementMeta.problemId;
 
-  if (cfg.get("createStatementMarkdown", true)) {
+  if (settings.createStatementMarkdown !== false) {
     const statementPath = path.join(dir, "statement.md");
     const body = statement || `# ${vars.index}.${vars.title || vars.qid || vars.problemId}\n\n${statementError ? `题面拉取失败：${statementError}\n` : ""}`;
-    await writeFileIfAbsent(statementPath, body);
+    await writeStatementFile(statementPath, body);
   }
 
-  const fileNames = codeFilesFromConfig(cfg);
-  const templates = mergeDefaultTemplates(cfg.get("templates", {}), cfg.get("deletedTemplates", DEFAULT_DELETED_TEMPLATES));
+  const fileNames = normalizeGeneratedFileNames(settings.fileNames || DEFAULT_CODE_FILES);
+  const templates = mergeDefaultTemplates(settings.templates || {}, settings.deletedTemplates || [], fileNames);
   const createdFiles = [];
   for (const fileName of fileNames) {
     const target = path.join(dir, safeRelativeFileName(fileName));
@@ -2678,7 +2685,7 @@ async function prepareProblemFolder(context, client, problem, baseDir, options =
   };
   await saveProblemBinding(context, dir, meta);
 
-  if (options.open !== false && cfg.get("openCreatedFile", true) && createdFiles[0]) {
+  if (options.open !== false && settings.openCreatedFile !== false && createdFiles[0]) {
     const doc = await vscode.workspace.openTextDocument(createdFiles[0]);
     await vscode.window.showTextDocument(doc);
   }
@@ -2737,11 +2744,12 @@ function formatQuestionMarkdown(question) {
   if (memoryLimit) lines.push(`内存限制：${memoryLimit}`);
   if (lines.length > 2) lines.push("");
 
+  const codingDesc = question.codingDesc || {};
+  const description = formatQuestionDescriptionMarkdown(question, codingDesc);
   lines.push("## 题目描述");
-  lines.push(htmlToMarkdown(question.content));
+  lines.push(description);
   lines.push("");
 
-  const codingDesc = question.codingDesc || {};
   const inputDesc = htmlToMarkdown(codingDesc.inputDesc);
   const outputDesc = htmlToMarkdown(codingDesc.outputDesc);
   if (inputDesc) {
@@ -2783,6 +2791,49 @@ function formatQuestionMarkdown(question) {
   return `${lines.join("\n").replace(/\n{3,}/g, "\n\n").trim()}\n`;
 }
 
+function formatQuestionDescriptionMarkdown(question, codingDesc = {}) {
+  const keys = [
+    "content",
+    "description",
+    "desc",
+    "questionDesc",
+    "questionDescription",
+    "problemDesc",
+    "problemDescription",
+    "codingDesc",
+    "codingDescription",
+    "detail",
+    "body",
+    "text"
+  ];
+  const chunks = [];
+  for (const source of [question || {}, codingDesc || {}]) {
+    for (const key of keys) {
+      const value = source[key];
+      if (value === undefined || value === null) continue;
+      if (typeof value !== "string" && typeof value !== "number") continue;
+      const markdown = htmlToMarkdown(value);
+      if (markdown) pushUniqueMarkdownChunk(chunks, markdown);
+    }
+  }
+  return chunks.join("\n\n");
+}
+
+function pushUniqueMarkdownChunk(chunks, value) {
+  const text = String(value || "").trim();
+  if (!text) return;
+  const normalized = normalizeMarkdownForCompare(text);
+  if (chunks.some(item => {
+    const other = normalizeMarkdownForCompare(item);
+    return other === normalized || other.includes(normalized) || normalized.includes(other);
+  })) return;
+  chunks.push(text);
+}
+
+function normalizeMarkdownForCompare(text) {
+  return String(text || "").replace(/\s+/g, "");
+}
+
 function parseAcmProblemPage(html, problem = {}) {
   if (/报名后才能查看题目|请登录|登录后才能/.test(html)) {
     throw new Error("当前账号无法查看题面，请先在牛客报名/登录后重试。");
@@ -2796,15 +2847,21 @@ function parseAcmProblemPage(html, problem = {}) {
   const header = index ? `# ${index}.${title || pageInfo.problemId || pageInfo.questionId}` : `# ${title || pageInfo.problemId || pageInfo.questionId}`;
   const lines = [header, ""];
 
-  const intro = firstMatch(html, /<div[^>]*class="[^"]*subject-item-wrap[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+  const intro = extractHtmlElementByClass(html, "div", "subject-item-wrap");
   const introText = htmlToMarkdown(intro);
   const limitInfo = extractAcmLimitInfo(introText);
   if (introText) {
     lines.push(introText, "");
   }
 
-  const description = firstMatch(html, /<div[^>]*class="[^"]*subject-question[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-  const descriptionText = htmlToMarkdown(description);
+  const descriptionChunks = [];
+  extractHtmlElementsByClass(html, "div", "subject-question")
+    .map(htmlToMarkdown)
+    .forEach(text => pushUniqueMarkdownChunk(descriptionChunks, text));
+  extractHtmlElementsByTag(htmlBeforeAcmInputSection(html), "pre")
+    .map(htmlToMarkdown)
+    .forEach(text => pushUniqueMarkdownChunk(descriptionChunks, text));
+  const descriptionText = descriptionChunks.join("\n\n");
   if (!descriptionText) {
     throw new Error("ACM 页面中没有解析到题目描述。");
   }
@@ -2851,6 +2908,79 @@ function parseAcmProblemPage(html, problem = {}) {
   };
 }
 
+function extractHtmlElementByClass(html, tagName, className) {
+  return extractHtmlElementsByClass(html, tagName, className)[0] || "";
+}
+
+function extractHtmlElementsByClass(html, tagName, className) {
+  const source = String(html || "");
+  const tag = escapeRegExp(tagName);
+  const startRe = new RegExp(`<${tag}\\b[^>]*>`, "gi");
+  const blocks = [];
+  let match;
+  while ((match = startRe.exec(source))) {
+    const classes = attrOf(match[0], "class").split(/\s+/).filter(Boolean);
+    if (!classes.includes(className)) continue;
+    const block = extractHtmlElementBlockAt(source, match.index, tagName);
+    if (!block) continue;
+    blocks.push(block.inner);
+    startRe.lastIndex = Math.max(startRe.lastIndex, block.end);
+  }
+  return blocks;
+}
+
+function extractHtmlElementsByTag(html, tagName) {
+  const source = String(html || "");
+  const tag = escapeRegExp(tagName);
+  const startRe = new RegExp(`<${tag}\\b[^>]*>`, "gi");
+  const blocks = [];
+  let match;
+  while ((match = startRe.exec(source))) {
+    const block = extractHtmlElementBlockAt(source, match.index, tagName);
+    if (!block) continue;
+    blocks.push(block.inner);
+    startRe.lastIndex = Math.max(startRe.lastIndex, block.end);
+  }
+  return blocks;
+}
+
+function htmlBeforeAcmInputSection(html) {
+  const source = String(html || "");
+  const marker = /<h2\b[^>]*>\s*(?:输入描述|输入)\s*[:：]?\s*<\/h2>/i.exec(source);
+  return marker ? source.slice(0, marker.index) : source;
+}
+
+function extractHtmlElementBlockAt(html, startIndex, tagName) {
+  const source = String(html || "");
+  const openEnd = source.indexOf(">", startIndex);
+  if (openEnd < 0) return null;
+  const tag = escapeRegExp(tagName);
+  const tagRe = new RegExp(`<\\/?${tag}\\b[^>]*>`, "gi");
+  tagRe.lastIndex = openEnd + 1;
+  let depth = 1;
+  let match;
+  while ((match = tagRe.exec(source))) {
+    const tagText = match[0];
+    if (/^<\s*\//.test(tagText)) {
+      depth -= 1;
+    } else if (!/\/\s*>$/.test(tagText)) {
+      depth += 1;
+    }
+    if (depth === 0) {
+      return {
+        inner: source.slice(openEnd + 1, match.index),
+        outer: source.slice(startIndex, tagRe.lastIndex),
+        end: tagRe.lastIndex
+      };
+    }
+  }
+  return {
+    inner: source.slice(openEnd + 1),
+    outer: source.slice(startIndex),
+    end: source.length
+  };
+}
+
 function extractAcmLimitInfo(text) {
   const normalized = String(text || "").replace(/\r/g, "").replace(/\u00a0/g, " ");
   const lines = normalized.split(/\n/).map(line => line.trim()).filter(Boolean);
@@ -2894,6 +3024,7 @@ function cleanLimitValue(value) {
 function htmlToMarkdown(html) {
   if (!html) return "";
   let text = String(html);
+  text = text.replace(/<(code|tt)\b[^>]*>([\s\S]*?)<\/\1>/gi, (_, _tag, body) => normalizeInlineCodeText(body));
   text = text.replace(/<img\b[^>]*>/gi, tag => {
     const src = attrOf(tag, "src");
     const alt = attrOf(tag, "alt");
@@ -2915,9 +3046,31 @@ function htmlToMarkdown(html) {
   text = stripTags(text);
   text = decodeHtml(text);
   text = text.replace(/\u00a0/g, " ");
+  text = normalizeExtractedMarkdown(text);
   text = text.replace(/[ \t]+\n/g, "\n");
   text = text.replace(/\n{3,}/g, "\n\n");
   return text.trim();
+}
+
+function normalizeInlineCodeText(html) {
+  const text = decodeHtml(stripTags(html || "")).trim();
+  if (!text) return "";
+  if (looksLikeLatex(text)) return text;
+  if (/^[+-]?\d+(?:\.\d+)?$/.test(text)) return text;
+  return `\`${text.replace(/`/g, "\\`")}\``;
+}
+
+function looksLikeLatex(text) {
+  const value = String(text || "").trim();
+  return /^\$[\s\S]*\$$/.test(value) || /\\[a-zA-Z]+|[_^{}]/.test(value);
+}
+
+function normalizeExtractedMarkdown(text) {
+  return String(text || "")
+    .replace(/\$\\texttt\{\s*`([^`'{}]+)'\s*\}\$/g, "$\\texttt{`$1'}$")
+    .replace(/\$\\texttt\{\s*`([^`'{}$]+)\$\s*[；;]?/g, "$\\texttt{`$1'}$；")
+    .replace(/\$\\texttt\{\s*([^{}$]+)\$\s*[；;]?/g, "$\\texttt{$1}$；")
+    .replace(/\\texttt\{\s*`([^`'{}]+)'\s*\}/g, "\\texttt{`$1'}");
 }
 
 function extractAcmSamples(html) {
@@ -3277,9 +3430,15 @@ function renderNowcoderAppHtml(webview) {
             showNotice('正在保存设置...', 'loading');
             post('saveSettings', { payload: collectSettings() });
           } else if (action === 'addTemplate') {
-            addOrUpdateTemplate();
+            if (addOrUpdateTemplate()) {
+              showNotice('正在保存模板...', 'loading');
+              post('saveSettings', { payload: collectSettings() });
+            }
           } else if (action === 'deleteTemplate') {
-            deleteCurrentTemplate();
+            if (deleteCurrentTemplate()) {
+              showNotice('正在保存模板...', 'loading');
+              post('saveSettings', { payload: collectSettings() });
+            }
           } else if (action === 'loadSubmissionRecords') {
             lastAutoSubmissionContestId = '';
             loadSelectedSubmissionRecords(true);
@@ -3742,7 +3901,7 @@ function renderNowcoderAppHtml(webview) {
       function renderTemplates(templates) {
         templateDrafts = {};
         Object.keys(templates || {}).sort(templateSort).forEach(name => {
-          const normalized = normalizeTemplateFileName(name);
+          const normalized = normalizeKnownCodeFileName(name);
           if (normalized) templateDrafts[normalized] = templates[name] || '';
         });
         renderTemplateList();
@@ -3773,7 +3932,7 @@ function renderNowcoderAppHtml(webview) {
       }
 
       function activateTemplate(name) {
-        const normalized = normalizeTemplateFileName(name);
+        const normalized = normalizeKnownCodeFileName(name);
         if (!normalized) return;
         activeTemplateName = normalized;
         renderTemplateList();
@@ -3781,30 +3940,28 @@ function renderNowcoderAppHtml(webview) {
       }
 
       function addOrUpdateTemplate() {
-        const name = normalizeTemplateFileName($('templateFileName').value);
+        const draft = currentTemplateEditDraft();
+        const name = draft.name;
         if (!name) {
           notify('请输入代码文件名。', 'warning');
-          return;
+          return false;
         }
-        $('templateFileName').value = name;
-        deletedTemplates = deletedTemplates.filter(item => item.toLowerCase() !== name.toLowerCase());
-        deleteTemplateDraft(name);
-        templateDrafts[name] = $('templateContent').value;
-        ensureFileNameInList(name);
+        applyTemplateEditDraft(draft);
         activateTemplate(name);
-        notify('模板已保存到当前设置：' + name);
+        notify(draft.renaming ? ('模板已重命名为：' + name) : ('模板已保存到当前设置：' + name));
+        return true;
       }
 
       function deleteCurrentTemplate() {
-        const name = normalizeTemplateFileName($('templateFileName').value || activeTemplateName);
+        const name = canonicalTemplateName($('templateFileName').value || activeTemplateName);
         if (!name) {
           notify('请选择或输入要删除的模板文件名。', 'warning');
-          return;
+          return false;
         }
         const existing = templateValueByName(name);
         if (existing === undefined && defaultTemplateByFile[name] === undefined) {
           notify('当前没有这个模板：' + name, 'warning');
-          return;
+          return false;
         }
         if (!deletedTemplates.some(item => item.toLowerCase() === name.toLowerCase())) {
           deletedTemplates.push(name);
@@ -3822,6 +3979,7 @@ function renderNowcoderAppHtml(webview) {
           updateTemplateActionLabel();
         }
         notify('模板已从当前设置中删除：' + name + '，保存设置后生效。');
+        return true;
       }
 
       function seedTemplateDraftForLanguage(forceName) {
@@ -3834,7 +3992,7 @@ function renderNowcoderAppHtml(webview) {
       }
 
       function loadTemplateDraft(fileName, preferredLanguage, options = {}) {
-        const name = normalizeTemplateFileName(fileName);
+        const name = normalizeKnownCodeFileName(fileName);
         if (!name) return;
         $('templateFileName').value = name;
         const lang = preferredLanguage || inferTemplateLanguage(name);
@@ -3851,23 +4009,28 @@ function renderNowcoderAppHtml(webview) {
       function updateTemplateActionLabel() {
         const label = $('templateActionLabel');
         if (!label) return;
-        const name = normalizeTemplateFileName($('templateFileName').value || activeTemplateName);
-        label.textContent = name && templateValueByName(name) !== undefined ? '更新模板' : '添加模板';
+        const name = normalizeKnownCodeFileName($('templateFileName').value || activeTemplateName);
+        const activeName = normalizeKnownCodeFileName(activeTemplateName);
+        const editingSelectedTemplate = activeName && templateValueByName(activeName) !== undefined;
+        const targetTemplateExists = name && templateValueByName(name) !== undefined;
+        label.textContent = name && (targetTemplateExists || editingSelectedTemplate) ? '更新模板' : '添加模板';
       }
 
       function ensureFileNameInList(name) {
+        const normalized = normalizeKnownCodeFileName(name);
+        if (!normalized) return;
         const files = splitLines($('fileNames').value);
-        if (!files.some(item => item.toLowerCase() === name.toLowerCase())) {
-          files.push(name);
+        if (!files.map(normalizeKnownCodeFileName).some(item => item.toLowerCase() === normalized.toLowerCase())) {
+          files.push(normalized);
           $('fileNames').value = joinLines(files);
         }
       }
 
-      function removeFileNameFromList(name) {
-        const key = String(name || '').toLowerCase();
+      function removeFileNameFromList(name, options = {}) {
+        const key = normalizeKnownCodeFileName(name).toLowerCase();
         const core = ['main.cpp', 'main.c', 'main.java', 'main.py'];
-        if (core.includes(key)) return;
-        const files = splitLines($('fileNames').value).filter(item => item.toLowerCase() !== key);
+        if (!options.force && core.includes(key)) return;
+        const files = splitLines($('fileNames').value).filter(item => normalizeKnownCodeFileName(item).toLowerCase() !== key);
         $('fileNames').value = joinLines(files);
       }
 
@@ -3875,6 +4038,60 @@ function renderNowcoderAppHtml(webview) {
         const key = String(name || '').toLowerCase();
         const found = Object.keys(templateDrafts).find(item => item.toLowerCase() === key);
         return found ? templateDrafts[found] : undefined;
+      }
+
+      function currentTemplateEditDraft() {
+        const typedName = normalizeKnownCodeFileName($('templateFileName').value);
+        const previousName = normalizeKnownCodeFileName(activeTemplateName);
+        const renaming = previousName && typedName && previousName.toLowerCase() !== typedName.toLowerCase();
+        return {
+          name: renaming ? canonicalTemplateNameForNewFile(typedName) : canonicalTemplateName(typedName),
+          previousName,
+          renaming,
+          content: $('templateContent').value
+        };
+      }
+
+      function applyTemplateEditDraft(draft) {
+        const name = draft && draft.name;
+        if (!name) return false;
+        if (draft.renaming && draft.previousName) {
+          deleteTemplateDraft(draft.previousName);
+          removeFileNameFromList(draft.previousName, { force: true });
+          if (defaultTemplateByFile[draft.previousName] !== undefined && !deletedTemplates.some(item => item.toLowerCase() === draft.previousName.toLowerCase())) {
+            deletedTemplates.push(draft.previousName);
+          }
+        }
+        $('templateFileName').value = name;
+        deletedTemplates = deletedTemplates.filter(item => item.toLowerCase() !== name.toLowerCase());
+        deleteTemplateDraft(name);
+        templateDrafts[name] = draft.content;
+        ensureFileNameInList(name);
+        return true;
+      }
+
+      function canonicalTemplateName(value) {
+        const name = normalizeKnownCodeFileName(value);
+        if (!name) return '';
+        const key = name.toLowerCase();
+        const existing = Object.keys(templateDrafts).find(item => item.toLowerCase() === key);
+        if (existing) return existing;
+        const listed = splitLines($('fileNames').value).map(normalizeKnownCodeFileName).find(item => item.toLowerCase() === key);
+        if (listed) return listed;
+        const defaultName = Object.keys(defaultTemplateByFile).find(item => item.toLowerCase() === key);
+        return defaultName || name;
+      }
+
+      function canonicalTemplateNameForNewFile(value) {
+        const name = normalizeKnownCodeFileName(value);
+        if (!name) return '';
+        const key = name.toLowerCase();
+        const listed = splitLines($('fileNames').value)
+          .map(normalizeKnownCodeFileName)
+          .find(item => item.toLowerCase() === key);
+        if (listed) return listed;
+        const defaultName = Object.keys(defaultTemplateByFile).find(item => item.toLowerCase() === key);
+        return defaultName || name;
       }
 
       function deleteTemplateDraft(name) {
@@ -3912,6 +4129,11 @@ function renderNowcoderAppHtml(webview) {
           .join('/');
       }
 
+      function normalizeKnownCodeFileName(value) {
+        const name = normalizeTemplateFileName(value);
+        return name.toLowerCase() === 'mai.cpp' ? 'main.cpp' : name;
+      }
+
       function fileExtension(name) {
         const file = String(name || '').split('/').pop() || '';
         const index = file.lastIndexOf('.');
@@ -3919,9 +4141,9 @@ function renderNowcoderAppHtml(webview) {
       }
 
       function collectSettings() {
-        const editingName = normalizeTemplateFileName($('templateFileName').value);
-        if (editingName && templateValueByName(editingName) !== undefined) {
-          templateDrafts[editingName] = $('templateContent').value;
+        const draft = currentTemplateEditDraft();
+        if (draft.name && (draft.renaming || templateValueByName(draft.name) !== undefined || draft.content.trim())) {
+          applyTemplateEditDraft(draft);
         }
         const templates = {};
         Object.keys(templateDrafts).sort(templateSort).forEach(name => templates[name] = templateDrafts[name]);
@@ -3959,7 +4181,7 @@ function renderNowcoderAppHtml(webview) {
         const seen = new Set();
         const files = [];
         (savedFiles && savedFiles.length ? savedFiles : ['main.cpp', 'main.c', 'Main.java', 'main.py']).forEach(name => {
-          const value = normalizeTemplateFileName(name);
+          const value = normalizeKnownCodeFileName(name);
           const key = value.toLowerCase();
           if (!value || seen.has(key)) return;
           seen.add(key);
@@ -4433,19 +4655,30 @@ function config() {
   return vscode.workspace.getConfiguration("nowcoder");
 }
 
+async function runtimeSettings(context, client) {
+  if (context && client) {
+    return loadAccountSettings(context, client).catch(err => {
+      if (output) output.appendLine(`读取账号设置失败，改用全局设置：${err.message}`);
+      return defaultSettings();
+    });
+  }
+  return defaultSettings();
+}
+
 async function loadAccountSettings(context, client) {
   const defaults = defaultSettings();
   const key = await accountSettingsKey(client);
   const accountSettings = context.globalState.get(key, {}) || {};
   return normalizeSettings({
     ...defaults,
-    ...accountSettings,
-    fileNames: defaults.fileNames
+    ...accountSettings
   });
 }
 
 function defaultSettings() {
   const cfg = config();
+  const fileNames = normalizeGeneratedFileNames(cfg.get("fileNames", DEFAULT_CODE_FILES));
+  const deletedTemplates = normalizeDeletedTemplates(cfg.get("deletedTemplates", DEFAULT_DELETED_TEMPLATES));
   return {
     defaultLanguage: cfg.get("defaultLanguage", "cpp"),
     cLanguage: normalizeLanguageVersion("c", cfg.get("cLanguage", "c_gcc10")),
@@ -4471,9 +4704,9 @@ function defaultSettings() {
     createStatementMarkdown: cfg.get("createStatementMarkdown", true),
     openCreatedFile: cfg.get("openCreatedFile", true),
     interfacePosition: cfg.get("interfacePosition", "left"),
-    fileNames: cfg.get("fileNames", DEFAULT_CODE_FILES),
-    templates: mergeDefaultTemplates(cfg.get("templates", {}), cfg.get("deletedTemplates", DEFAULT_DELETED_TEMPLATES)),
-    deletedTemplates: normalizeDeletedTemplates(cfg.get("deletedTemplates", DEFAULT_DELETED_TEMPLATES))
+    fileNames,
+    templates: mergeDefaultTemplates(cfg.get("templates", {}), deletedTemplates, fileNames),
+    deletedTemplates
   };
 }
 
@@ -4481,6 +4714,8 @@ function normalizeSettings(payload) {
   const defaults = defaultSettings();
   const payloadFileNames = normalizeFileNames(payload.fileNames);
   const defaultFileNames = normalizeFileNames(defaults.fileNames);
+  const fileNames = normalizeGeneratedFileNames(payloadFileNames.length ? payloadFileNames : defaultFileNames);
+  const deletedTemplates = normalizeDeletedTemplates(payload.deletedTemplates || defaults.deletedTemplates || []);
   return {
     interfacePosition: normalizeInterfacePosition(payload.interfacePosition || defaults.interfacePosition),
     defaultLanguage: payload.defaultLanguage || defaults.defaultLanguage || "cpp",
@@ -4506,9 +4741,9 @@ function normalizeSettings(payload) {
     prepareConcurrency: clampPositiveInt(payload.prepareConcurrency, defaults.prepareConcurrency || DEFAULT_PREPARE_CONCURRENCY, 1, 10),
     createStatementMarkdown: payload.createStatementMarkdown !== undefined ? !!payload.createStatementMarkdown : defaults.createStatementMarkdown,
     openCreatedFile: payload.openCreatedFile !== undefined ? !!payload.openCreatedFile : defaults.openCreatedFile,
-    fileNames: normalizeGeneratedFileNames(payloadFileNames.length ? payloadFileNames : defaultFileNames),
-    templates: mergeDefaultTemplates(payload.templates || defaults.templates || {}, payload.deletedTemplates || defaults.deletedTemplates || []),
-    deletedTemplates: normalizeDeletedTemplates(payload.deletedTemplates || defaults.deletedTemplates || [])
+    fileNames,
+    templates: mergeDefaultTemplates(payload.templates || defaults.templates || {}, deletedTemplates, fileNames),
+    deletedTemplates
   };
 }
 
@@ -4516,7 +4751,7 @@ function normalizeGeneratedFileNames(fileNames) {
   const seen = new Set();
   const files = [];
   for (const file of normalizeFileNames(fileNames)) {
-    const name = normalizeTemplateFileName(file);
+    const name = normalizeKnownCodeFileName(file);
     const key = name.toLowerCase();
     if (!name || seen.has(key)) continue;
     seen.add(key);
@@ -4525,13 +4760,35 @@ function normalizeGeneratedFileNames(fileNames) {
   return files.length ? files : DEFAULT_CODE_FILES.slice();
 }
 
-function mergeDefaultTemplates(templates, deletedTemplates = []) {
+function mergeDefaultTemplates(templates, deletedTemplates = [], fileNames = []) {
   const deleted = new Set(normalizeDeletedTemplates(deletedTemplates).map(name => name.toLowerCase()));
-  const merged = { ...DEFAULT_TEMPLATES, ...(templates || {}) };
+  const merged = normalizeTemplateMap({ ...DEFAULT_TEMPLATES, ...(templates || {}) }, fileNames);
   for (const name of Object.keys(merged)) {
     if (deleted.has(name.toLowerCase())) delete merged[name];
   }
   return merged;
+}
+
+function normalizeTemplateMap(templates, fileNames = []) {
+  const normalized = {};
+  for (const [rawName, value] of Object.entries(templates || {})) {
+    const name = canonicalTemplateFileName(rawName, fileNames);
+    if (!name) continue;
+    normalized[name] = value === undefined || value === null ? "" : String(value);
+  }
+  return normalized;
+}
+
+function canonicalTemplateFileName(value, fileNames = []) {
+  const name = normalizeKnownCodeFileName(value);
+  if (!name) return "";
+  const key = name.toLowerCase();
+  const listed = normalizeFileNames(fileNames)
+    .map(normalizeKnownCodeFileName)
+    .find(item => item.toLowerCase() === key);
+  if (listed) return listed;
+  const defaultName = Object.keys(DEFAULT_TEMPLATES).find(item => item.toLowerCase() === key);
+  return defaultName || name;
 }
 
 function normalizeDeletedTemplates(value) {
@@ -4616,6 +4873,11 @@ function normalizeTemplateFileName(value) {
     .map(part => part.trim())
     .filter(part => part && part !== "." && part !== "..")
     .join("/");
+}
+
+function normalizeKnownCodeFileName(value) {
+  const name = normalizeTemplateFileName(value);
+  return name.toLowerCase() === "mai.cpp" ? "main.cpp" : name;
 }
 
 async function accountSettingsKey(client) {
@@ -6191,13 +6453,32 @@ function formatNumericLimit(value, unit, formatter) {
 }
 
 function templateForFile(fileName, templates) {
-  if (templates && templates[fileName] !== undefined) return templates[fileName];
+  const direct = templateValueForFileName(fileName, templates);
+  if (direct.found) return direct.value;
   const ext = path.extname(fileName).toLowerCase();
-  if (ext === ".c") return templates["main.c"] || "";
-  if (ext === ".cpp" || ext === ".cc" || ext === ".cxx") return templates["main.cpp"] || "";
-  if (ext === ".py") return templates["main.py"] || "";
-  if (ext === ".java") return templates["Main.java"] || "";
-  return "";
+  const fallbackName = ext === ".c"
+    ? "main.c"
+    : ext === ".cpp" || ext === ".cc" || ext === ".cxx"
+      ? "main.cpp"
+      : ext === ".py"
+        ? "main.py"
+        : ext === ".java"
+          ? "Main.java"
+          : "";
+  if (!fallbackName) return "";
+  const fallback = templateValueForFileName(fallbackName, templates);
+  return fallback.found ? fallback.value : "";
+}
+
+function templateValueForFileName(fileName, templates) {
+  if (!templates || !fileName) return { found: false, value: "" };
+  if (Object.prototype.hasOwnProperty.call(templates, fileName)) {
+    return { found: true, value: templates[fileName] };
+  }
+  const key = String(fileName).toLowerCase();
+  const found = Object.keys(templates).find(name => name.toLowerCase() === key);
+  if (found) return { found: true, value: templates[found] };
+  return { found: false, value: "" };
 }
 
 function safePathName(name) {
@@ -6229,6 +6510,52 @@ async function writeFileIfAbsent(file, content) {
   }
 }
 
+async function writeStatementFile(file, content) {
+  const created = await writeFileIfAbsent(file, content);
+  if (created) return true;
+  const current = await fsp.readFile(file, "utf8").catch(() => null);
+  if (current === null || !shouldRefreshStatementMarkdown(current, content)) return false;
+  await fsp.writeFile(file, content, "utf8");
+  return true;
+}
+
+function shouldRefreshStatementMarkdown(current, next) {
+  const currentText = String(current || "").trim();
+  const nextText = String(next || "").trim();
+  if (!nextText || currentText === nextText) return false;
+  if (/题面拉取失败/.test(currentText)) return true;
+  if (hasBrokenTextttMarkdown(currentText) && !hasBrokenTextttMarkdown(nextText)) return true;
+  const currentDesc = extractMarkdownSection(currentText, "题目描述");
+  const nextDesc = extractMarkdownSection(nextText, "题目描述");
+  if (!currentDesc || !nextDesc) return false;
+  const currentNorm = normalizeMarkdownForCompare(currentDesc);
+  const nextNorm = normalizeMarkdownForCompare(nextDesc);
+  return nextNorm.length >= currentNorm.length + 40 && nextNorm.includes(currentNorm);
+}
+
+function hasBrokenTextttMarkdown(text) {
+  return /\$\\texttt\{\s*`[^`'{}$]+\$\s*[；;]?/.test(String(text || ""));
+}
+
+function extractMarkdownSection(markdown, heading) {
+  const lines = String(markdown || "").replace(/\r/g, "").split("\n");
+  const headingRe = new RegExp(`^##\\s+${escapeRegExp(heading)}\\s*$`);
+  let start = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (headingRe.test(lines[i].trim())) {
+      start = i + 1;
+      break;
+    }
+  }
+  if (start < 0) return "";
+  const body = [];
+  for (let i = start; i < lines.length; i += 1) {
+    if (/^##\s+/.test(lines[i].trim())) break;
+    body.push(lines[i]);
+  }
+  return body.join("\n").trim();
+}
+
 async function exists(file) {
   try {
     await fsp.access(file);
@@ -6236,6 +6563,13 @@ async function exists(file) {
   } catch (err) {
     return false;
   }
+}
+
+function withQueryParam(url, key, value) {
+  const text = String(value || "").trim();
+  if (!text) return url;
+  const separator = String(url).includes("?") ? "&" : "?";
+  return `${url}${separator}${encodeURIComponent(key)}=${encodeURIComponent(text)}`;
 }
 
 function showHtmlPanel(viewType, title, html) {
@@ -6526,17 +6860,21 @@ module.exports = {
     extractAcmLimitInfo,
     firstPresent,
     formatMemoryLimit,
+    formatQuestionMarkdown,
     formatSubmissionMemory,
     formatSubmissionRuntime,
     formatTimeLimit,
     htmlToMarkdown,
     inferProblemMetaFromPath,
+    mergeDefaultTemplates,
     normalizeContestSubmission,
     normalizeGeneratedFileNames,
     normalizeImportBrowser,
+    normalizeKnownCodeFileName,
     normalizeProblemLike,
     normalizeSubmissionCodeValue,
     normalizeTemplateFileName,
+    parseAcmProblemPage,
     parseContestDirName,
     parseProblemDirName,
     renderNowcoderAppHtml,
@@ -6544,8 +6882,11 @@ module.exports = {
     resolveEnvPath,
     safePathName,
     safeRelativeFileName,
+    shouldRefreshStatementMarkdown,
     stripContestIdFromName,
+    templateForFile,
     upsertCodeFileHeader,
+    withQueryParam,
     vscodeLanguageFromSubmission
   }
 };
